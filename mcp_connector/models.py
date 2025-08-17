@@ -11,6 +11,7 @@ class Supplier:
     phone: Optional[str] = None
     country: Optional[str] = None
     tax_id: Optional[str] = None
+    email: Optional[str] = None
 
 @dataclass
 class Proforma:
@@ -36,6 +37,24 @@ class Invoice:
     account: str
     our_company: str
 
+@dataclass
+class Contract:
+    bill_number: str
+    supplier: Supplier
+    date: str
+    currency: str
+    total_amount: float
+    item_details: str
+    account: str
+    our_company: str
+    # Поля специфичные для контрактов
+    vin: str = ""
+    car_model: str = ""
+    car_item_name: str = ""
+    contract_type: str = "purchase"  # purchase, lease, etc.
+    delivery_date: str = ""
+    payment_terms: str = ""
+
 def supplier_from_dict(data):
     return Supplier(
         name=data.get("name"),
@@ -44,6 +63,7 @@ def supplier_from_dict(data):
         phone=data.get("phone"),
         country=data.get("country"),
         tax_id=data.get("tax_id"),
+        email=data.get("email"),
     )
 
 def proforma_from_dict(data):

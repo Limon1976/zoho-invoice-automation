@@ -8,11 +8,12 @@ from requests.exceptions import RequestException
 from dotenv import load_dotenv
 
 from functions.assistant_logic import process_invoice_json, process_proforma_json, SYSTEM_PROMPT, detect_account
+from functions.llm_document_extractor import llm_extract_fields, llm_analyze_contract_risks
 from functions.zoho_api import get_existing_bill_numbers
 from mcp_connector.pdf_parser import extract_text_from_pdf
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+# Логи настраиваются централизованно в telegram_bot/bot_main.py
 
 # Наши компании - только основные варианты (VAT решает!)
 OUR_COMPANIES = [
@@ -1165,6 +1166,59 @@ def check_document_ownership(data: dict, ocr_text: str) -> dict:
                 logging.info(f"✅ Найден VAT нашей компании без префикса: {vat_digits} (полный: {comp_vat})")
                 break
     
+    # 2.1. УЛУЧШЕННЫЙ ПОИСК: Проверяем VAT с форматированием (например, "527-295-61-46" -> "PL5272956146")
+    if not our_company_found_in_doc:
+        # Нормализуем OCR текст (убираем пробелы и дефисы)
+        ocr_normalized = re.sub(r'[\s\-]', '', ocr_text)
+        
+        for comp in OUR_COMPANIES:
+            comp_vat = comp["vat"]
+            vat_digits = re.sub(r'^[A-Z]{2}', '', comp_vat)
+            
+            # Проверяем нормализованный VAT
+            if len(vat_digits) >= 8 and vat_digits in ocr_normalized:
+                our_company_found_in_doc = True
+                logging.info(f"✅ Найден VAT нашей компании (нормализованный): {vat_digits} (полный: {comp_vat})")
+                break
+        
+    # 2.2. КОНТЕКСТНЫЙ ПОИСК: Ищем VAT с префиксами NIP:, VAT:, etc.
+    if not our_company_found_in_doc:
+        for comp in OUR_COMPANIES:
+            comp_vat = comp["vat"]
+            vat_digits = re.sub(r'^[A-Z]{2}', '', comp_vat)
+            
+            if len(vat_digits) == 10:  # Polish VAT
+                # Ищем форматы: 527-295-61-46, NIP: 527-295-61-46, etc.
+                formatted_patterns = [
+                    f"{vat_digits[:3]}-{vat_digits[3:6]}-{vat_digits[6:8]}-{vat_digits[8:]}",  # 527-295-61-46
+                    f"{vat_digits[:3]} {vat_digits[3:6]} {vat_digits[6:8]} {vat_digits[8:]}",   # 527 295 61 46
+                ]
+                
+                for pattern in formatted_patterns:
+                    if pattern in ocr_text:
+                        our_company_found_in_doc = True
+                        logging.info(f"✅ Найден VAT нашей компании (форматированный): {pattern} (полный: {comp_vat})")
+                        break
+                
+                if our_company_found_in_doc:
+                    break
+                
+                # Поиск с контекстными словами
+                vat_context_patterns = [
+                    rf'NIP:\s*{re.escape(vat_digits[:3])}.{re.escape(vat_digits[3:6])}.{re.escape(vat_digits[6:8])}.{re.escape(vat_digits[8:])}',
+                    rf'VAT:\s*{re.escape(comp_vat)}',
+                    rf'TAX\s*ID:\s*{re.escape(vat_digits)}',
+                ]
+                
+                for pattern in vat_context_patterns:
+                    if re.search(pattern, ocr_text, re.IGNORECASE):
+                        our_company_found_in_doc = True
+                        logging.info(f"✅ Найден VAT нашей компании (контекстный): {pattern} (полный: {comp_vat})")
+                        break
+                
+                if our_company_found_in_doc:
+                    break
+    
     # 3. Проверяем VAT в данных от OpenAI (supplier и our_company)
     if not our_company_found_in_doc:
         if is_our_company("", supplier_vat) or is_our_company("", our_company_vat):
@@ -1286,11 +1340,29 @@ def check_document_ownership(data: dict, ocr_text: str) -> dict:
     
     return data
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID")
-if not ASSISTANT_ID or not isinstance(ASSISTANT_ID, str):
-    raise RuntimeError("Не задан OPENAI_ASSISTANT_ID в переменных окружения!")
-ASSISTANT_ID = str(ASSISTANT_ID)
+# Lazy и безопасная инициализация OpenAI клиента, чтобы импорт модуля не падал
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:
+    OpenAI = None  # type: ignore
+
+client = None
+ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID") or ""
+
+def _ensure_openai_client():
+    global client
+    if client is not None:
+        return client
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not OpenAI or not api_key or not ASSISTANT_ID:
+            return None
+        # Некоторые версии SDK могут не поддерживать аргумент proxies; используем минимальный вызов
+        client_local = OpenAI(api_key=api_key)
+        client = client_local
+        return client
+    except Exception:
+        return None
 
 def extract_json_block(text: str) -> str:
     """Извлекает JSON-блок из строки"""
@@ -1323,61 +1395,88 @@ def analyze_proforma_via_agent(file_path: str) -> dict:
         
         logging.info(f"Анализируем файл: {file_path}")
         
-        # Создаем thread и отправляем сообщение
-        thread = client.beta.threads.create()
-        message = client.beta.threads.messages.create(
-            thread_id=thread.id,
-            role="user",
-            content=f"Проанализируй этот документ:\n\n{ocr_text}"
-        )
-        
-        # Запускаем assistant
-        run = client.beta.threads.runs.create(
-            thread_id=thread.id,
-            assistant_id=str(ASSISTANT_ID)
-        )
-        
-        # Ждем завершения
-        while True:
-            run_status = client.beta.threads.runs.retrieve(
+        # 1) Пытаемся извлечь поля через GPT-4 (function-calling JSON)
+        data = llm_extract_fields(ocr_text) or {}
+        # Если это потенциально «цветочный» документ — параллельно включаем проверку через Assistants API
+        looks_flower = any(k in (ocr_text or '').lower() for k in ["kwiat", "kwiaty", "flowers", "róża", "tulip", "stawka vat", "cena brutto"]) 
+        if looks_flower:
+            try:
+                cli = _ensure_openai_client()
+                if cli:
+                    thread = cli.beta.threads.create()
+                    cli.beta.threads.messages.create(
+                        thread_id=thread.id,
+                        role="user",
+                        content=(
+                            "Extract full structured JSON for a Polish flower invoice, including per-line items (name, qty, unit, unit_price_net, vat_percent), "
+                            "document_number, dates, supplier (name, vat, address with street/city/zip/country), and totals (net_amount, vat_amount, gross_amount).\n\n" 
+                            + ocr_text
+                        ),
+                    )
+                    run = cli.beta.threads.runs.create(thread_id=thread.id, assistant_id=str(ASSISTANT_ID))
+                    while True:
+                        run_status = cli.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+                        if run_status.status == 'completed':
+                            break
+                        if run_status.status == 'failed':
+                            raise Exception(f"Assistant failed: {run_status.last_error}")
+                        time.sleep(1)
+                    messages = cli.beta.threads.messages.list(thread_id=thread.id)
+                    response_text = None
+                    for block in messages.data[0].content:
+                        if getattr(block, "type", None) == "text":
+                            text_obj = getattr(block, "text", None)
+                            if text_obj and hasattr(text_obj, "value"):
+                                response_text = text_obj.value
+                                break
+                    json_str = extract_json_block(response_text or '')
+                    if json_str:
+                        assistant_data = json.loads(json_str)
+                        # Сливаем важные поля, если у LLM пусто
+                        for key in ["supplier_address", "supplier_country", "supplier_street", "supplier_city", "supplier_zip_code", "net_amount", "vat_amount", "gross_amount", "flower_lines"]:
+                            if (not data.get(key)) and assistant_data.get(key):
+                                data[key] = assistant_data.get(key)
+            except Exception:
+                pass
+        if not data:
+            # 2) Fallback на прежнюю схему Assistant API
+            cli = _ensure_openai_client()
+            if not cli:
+                raise Exception("OpenAI клиент недоступен: проверьте OPENAI_API_KEY/ASSISTANT_ID")
+            thread = cli.beta.threads.create()
+            message = cli.beta.threads.messages.create(
                 thread_id=thread.id,
-                run_id=run.id
+                role="user",
+                content=f"Проанализируй этот документ:\n\n{ocr_text}"
             )
-            if run_status.status == 'completed':
-                break
-            elif run_status.status == 'failed':
-                raise Exception(f"Assistant failed: {run_status.last_error}")
-            time.sleep(1)
-        
-        # Получаем ответ
-        messages = client.beta.threads.messages.list(thread_id=thread.id)
-        # Найдём первый текстовый блок
-        response_text = None
-        for block in messages.data[0].content:
-            if getattr(block, "type", None) == "text":
-                text_obj = getattr(block, "text", None)
-                if text_obj and hasattr(text_obj, "value"):
-                    response_text = text_obj.value
+            run = cli.beta.threads.runs.create(
+                thread_id=thread.id,
+                assistant_id=str(ASSISTANT_ID)
+            )
+            while True:
+                run_status = cli.beta.threads.runs.retrieve(
+                    thread_id=thread.id,
+                    run_id=run.id
+                )
+                if run_status.status == 'completed':
                     break
-        if response_text is None:
-            # Если нет текстового блока, ищем первый блок, который можно привести к строке
+                elif run_status.status == 'failed':
+                    raise Exception(f"Assistant failed: {run_status.last_error}")
+                time.sleep(1)
+            messages = cli.beta.threads.messages.list(thread_id=thread.id)
+            response_text = None
             for block in messages.data[0].content:
-                if isinstance(block, str):
-                    response_text = block
-                    break
-                try:
-                    response_text = str(block)
-                    break
-                except Exception:
-                    continue
-        if response_text is None:
-            response_text = ''
-        # Извлекаем JSON
-        json_str = extract_json_block(response_text or '')
-        if not json_str:
-            raise Exception("Не удалось извлечь JSON из ответа assistant")
-        # Парсим JSON
-        data = json.loads(json_str)
+                if getattr(block, "type", None) == "text":
+                    text_obj = getattr(block, "text", None)
+                    if text_obj and hasattr(text_obj, "value"):
+                        response_text = text_obj.value
+                        break
+            if response_text is None:
+                response_text = ''
+            json_str = extract_json_block(response_text or '')
+            if not json_str:
+                raise Exception("Не удалось извлечь JSON из ответа assistant")
+            data = json.loads(json_str)
         
         # Сначала исправляем supplier если нужно
         data = fix_supplier_if_needed(data, ocr_text or "")
@@ -1397,17 +1496,21 @@ def analyze_proforma_via_agent(file_path: str) -> dict:
             item_details = str(item_details) if item_details is not None else ""
         
         if item_details:
-            data["account"] = detect_account(item_details)
+            supplier_name = data.get("supplier", {}).get("name", "")
+            data["account"] = detect_account(item_details, supplier_name=supplier_name, full_text=ocr_text)
         
         # Определяем, покупаем ли мы машины или оплачиваем услуги
         is_car_purchase = is_car_purchase_vs_service(item_details, ocr_text or "")
         
         # Для автомобильных документов обрабатываем VIN и car_item_name
         vin = data.get("vin", "")
+        # Попытаемся взять car_brand/model из LLM-экстракции
+        extracted_brand = data.get("car_brand") or ""
+        extracted_model = data.get("car_model") or data.get("model") or ""
         if vin and len(vin) >= 17:
             if is_car_purchase:
                 # Для покупки автомобиля: расширяем item_details добавив VIN и доп. детали
-                car_model = data.get("car_model", "")
+                car_model = extracted_model
                 enhanced_details = enhance_car_details_for_purchase(item_details, vin, car_model, ocr_text or "")
                 data["item_details"] = enhanced_details
                 logging.info(f"🚗 Покупка автомобиля: item_details расширен деталями: {enhanced_details}")
@@ -1418,9 +1521,11 @@ def analyze_proforma_via_agent(file_path: str) -> dict:
             # Исправляем car_item_name - последние 5 ЦИФР VIN (для всех типов документов с VIN)
             last_5_digits = re.sub(r'[^0-9]', '', vin)[-5:] if re.sub(r'[^0-9]', '', vin) else ""
             if last_5_digits and len(last_5_digits) == 5:
-                car_model = data.get("car_model", "")
-                if car_model:
-                    data["car_item_name"] = f"{car_model}_{last_5_digits}"
+                car_brand = extracted_brand
+                car_model = extracted_model
+                name_parts = [p for p in [car_brand, car_model] if p]
+                if name_parts:
+                    data["car_item_name"] = f"{' '.join(name_parts)}_{last_5_digits}"
         
         # Для услуг - убеждаемся, что item_details содержит описание услуги
         if not is_car_purchase:
@@ -1480,6 +1585,19 @@ def analyze_proforma_via_agent(file_path: str) -> dict:
             if not our_vat_found:
                 logging.warning("❗️ Внимание: VAT вашей компании не найден в документе!")
         
+        # 3) Если документ — контракт/продажа, дополнительно анализируем риски
+        doc_type = (data.get("document_type") or "").lower()
+        if any(k in doc_type for k in ["contract", "sale", "proforma", "purchase"]):
+            risks = llm_analyze_contract_risks(ocr_text) or {}
+            if risks:
+                data["contract_risks"] = risks
+
+        # Проставим контактное лицо, если LLM его дал
+        contact_person = data.get("contact_person") or data.get("issuer_contact_person")
+        if contact_person:
+            data.setdefault("supplier", {})
+            data["supplier"]["contact_person"] = contact_person
+
         logging.info(f"Результат анализа: {json.dumps(data, ensure_ascii=False, indent=2)}")
         return data
         

@@ -26,20 +26,20 @@ OUR_COMPANIES = [
         "name": "TaVie Europe OÜ",
         "vat": "EE102288270",
         "address": "Harju maakond, Tallinn, Kesklinna linнаоса, Pirita tee 26f-11, 12011",
-        "country": "Эстония",
+        "country": "EE",
     },
     {
         "name": "Parkentertainment Sp. z o.o.",
         "vat": "PL5272956146",
         "address": "UL. KROCHMALNA 54 /U6, 00-864, Warszawa",
-        "country": "Польша",
+        "country": "PL",
     },
     # --- Можно добавить варианты написаний ---
     {
         "name": "TaVie Europe OU",
         "vat": "EE102288270",
         "address": "",
-        "country": "",
+        "country": "EE",
     },
 ]
 
@@ -52,6 +52,8 @@ def guess_document_type(data: dict, ocr_text: str) -> str:
         return "Proforma"
     if any(word in ocr_top for word in ["credit note", "gutschrift"]):
         return "Credit Note"
+    if any(word in ocr_top for word in ["contract", "vertrag", "bestellung", "purchase order", "договор", "контракт"]):
+        return "Contract"
     if any(word in ocr_top for word in ["invoice", "rechnung", "facture", "fattura", "factura", "faktura", "счет", "bill", "retainer"]):
         # Если одновременно есть и invoice и proforma в верхней части, отдаём приоритет proforma
         if "proforma" in ocr_top:
@@ -62,11 +64,14 @@ def guess_document_type(data: dict, ocr_text: str) -> str:
     has_proforma = "proforma" in ocr
     has_invoice = any(word in ocr for word in ["invoice", "rechnung", "facture", "fattura", "factura", "faktura", "счет", "bill", "retainer"])
     has_credit_note = "credit note" in ocr or "gutschrift" in ocr
+    has_contract = any(word in ocr for word in ["contract", "vertrag", "bestellung", "purchase order", "договор", "контракт"])
 
     if has_proforma and has_invoice:
         return "Proforma"
     if has_proforma:
         return "Proforma"
+    if has_contract:
+        return "Contract"
     if has_invoice:
         return "Invoice"
     if has_credit_note:
@@ -181,12 +186,32 @@ def extract_vin_from_item_details(item_details: str) -> str:
 
 
 SYSTEM_PROMPT = """
-Ты — ассистент по структурированию документов (Proforma/Invoice) для Zoho Books. На вход получаешь только распознанный текст PDF (OCR).
+Ты — ассистент по структурированию документов (Proforma/Invoice/Contract) для Zoho Books. На вход получаешь только распознанный текст PDF (OCR).
 
-1. Определи тип документа (Invoice, Proforma, Credit Note и т.д.) исключительно по заголовку или верхней части документа (например, слова 'Rechnung', 'Invoice', 'Proforma Invoice' и т.д.).
-2. ВСЕГДА добавляй поле "document_type" в JSON с одним из значений: "Invoice", "Proforma", "Credit Note" и т.д.
+1. Определи тип документа (Invoice, Proforma, Credit Note, Contract и т.д.) исключительно по заголовку или верхней части документа (например, слова 'Rechnung', 'Invoice', 'Proforma Invoice', 'Contract', 'Vertrag', 'Bestellung' и т.д.).
+2. ВСЕГДА добавляй поле "document_type" в JSON с одним из значений: "Invoice", "Proforma", "Credit Note", "Contract" и т.д.
 3. Извлекай все необходимые поля даже если они разбросаны по тексту.
 4. Верни ТОЛЬКО валидный JSON (см. ниже), никаких комментариев, пояснений или текста. Если поле не найдено — для строки верни "", для числа или логического значения — null.
+
+КРИТИЧЕСКИ ВАЖНО - правильное извлечение данных ПОСТАВЩИКА:
+- ПОСТАВЩИК (supplier) = компания/лицо, которое ВЫСТАВЛЯЕТ счет и ПРОДАЕТ товар/услугу
+- НЕ путай поставщика с получателем счета (Bill To, Ship To, Customer, Nabywca, Kunde)
+- Email поставщика = email из секции поставщика, НЕ из секции "Bill To" или клиента
+- Телефон поставщика = телефон из секции поставщика, НЕ из секции клиента
+- VAT поставщика = VAT номер поставщика, НЕ VAT получателя счета
+
+Структура документа:
+- В верхней части: данные ПОСТАВЩИКА (name, address, phone, email, VAT)
+- В средней части: "Bill To" / "Ship To" / "Customer" / "Nabywca" = данные ПОЛУЧАТЕЛЯ
+- В нижней части: товары/услуги и суммы
+
+КРИТИЧЕСКИ ВАЖНО - правильное извлечение данных АВТОМОБИЛЯ:
+- car_model = ПОЛНОЕ название автомобиля = МАРКА + МОДЕЛЬ
+- Примеры ПРАВИЛЬНЫХ car_model: "MERCEDES BENZ S65 AMG", "RANGE ROVER SPORT PHEV", "BMW X6", "FERRARI 488 GTB"
+- Примеры НЕПРАВИЛЬНЫХ car_model: "S65 AMG" (без марки), "SPORT PHEV" (без марки), "488 GTB" (без марки)
+- Если есть отдельные поля "MARCA/BRAND" и "MODELO/MODEL" - объединяй их: "MARCA MODELO"
+- Если в тексте: "MARCA: RANGE ROVER, MODELO: SPORT PHEV" → car_model = "RANGE ROVER SPORT PHEV"
+- Если в тексте: "MERCEDES BENZ S65 AMG" → car_model = "MERCEDES BENZ S65 AMG"
 
 Обязательные требования:
 - Для поля "item_details" ВСЕГДА используй реальное описание товара/услуги из документа. Примеры:
@@ -198,12 +223,16 @@ SYSTEM_PROMPT = """
 - Для поля "account" — НИКОГДА не вставляй банковские реквизиты (IBAN, SWIFT, BIC, название банка, номер счета и т.д.), а только название категории расходов по ключевым словам из справочника или по тексту услуги.
 - Если в документе есть строка с юридическим лицом (обычно перед строкой с VAT/EIN/NIP), supplier должен быть именно этим юридическим лицом, а не брендом/платформой. Бренд/платформу можно сохранить в отдельное поле (например, 'brand' или 'service_name'), если нужно.
 - Пример: если в документе есть 'Anysphere, Inc.' перед 'US EIN 87-4436547', supplier = 'Anysphere, Inc.', supplier.vat = '87-4436547'.
+- VAT номера: извлекай ТОЧНО как написано, без лишних префиксов. Если написано "NIP 5272956146", то vat = "5272956146" (без NIP). Если "PL5272956146", то vat = "PL5272956146".
 
 Пример для Invoice:
-{"document_type": "Invoice", "bill_number": "", "supplier": {"name": "", "vat": "", "address": "", "country": ""}, "date": "", "currency": "", "total_amount": null, "item_details": "", "account": "", "our_company": ""}
+{"document_type": "Invoice", "bill_number": "", "supplier": {"name": "", "vat": "", "address": "", "country": "", "email": "", "phone": ""}, "date": "", "currency": "", "total_amount": null, "item_details": "", "account": "", "our_company": ""}
 
 Пример для Proforma:
-{"document_type": "Proforma", "vin": "", "cost_price": null, "supplier": {"name": "", "vat": "", "address": "", "phone": "", "country": ""}, "car_model": "", "car_item_name": "", "is_valid_for_us": null, "our_company": "", "tax_rate": "", "currency": "", "payment_terms": ""}
+{"document_type": "Proforma", "vin": "", "cost_price": null, "supplier": {"name": "", "vat": "", "address": "", "phone": "", "country": "", "email": ""}, "car_model": "", "car_item_name": "", "is_valid_for_us": null, "our_company": "", "tax_rate": "", "currency": "", "payment_terms": ""}
+
+Пример для Contract:
+{"document_type": "Contract", "bill_number": "", "supplier": {"name": "", "vat": "", "address": "", "country": "", "email": "", "phone": ""}, "date": "", "currency": "", "total_amount": null, "item_details": "", "account": "", "our_company": "", "vin": "", "car_model": "", "car_item_name": "", "contract_type": "purchase", "payment_terms": ""}
 
 ВСЕГДА выдавай только валидный JSON, даже если не найдено ни одно поле. Никаких пояснений, текста, комментариев или дополнительной информации — только JSON!
 """
@@ -271,25 +300,49 @@ def force_clean_item_details_and_account(data):
     account = data.get("account", "")
     forbidden_words = ["iban", "swift", "bic", "bank", "konto", "расчетный счет", "acc.", "acc:", "номер счета"]
     if any(word in account.lower() for word in forbidden_words):
-        data["account"] = detect_account(data.get("item_details", ""))
+        data["account"] = detect_account(data.get("item_details", ""), "", "")
 
-def detect_account(item_details: str) -> str:
-    # Безопасно обрабатываем разные типы данных
-    if isinstance(item_details, list):
-        # Если список, объединяем элементы в строку
-        item_details = " ".join(str(item) for item in item_details)
-    elif not isinstance(item_details, str):
-        # Если не строка, преобразуем в строку
-        item_details = str(item_details) if item_details is not None else ""
-    
-    item_lower = item_details.lower()
-    # Добавлено условие для consulting/consultant
-    if "consulting" in item_lower or "consultant" in item_lower:
-        return "Consultant Expense"
-    for keyword, account in DESCRIPTION_TO_ACCOUNT.items():
-        if keyword in item_lower:
-            return account
-    return "Other Expenses"
+def detect_account(item_details: str, supplier_name: str = "", full_text: str = "") -> str:
+    """
+    Интеллектуальное определение категории с использованием гибридного детектора.
+    Fallback к простому словарю если гибридный детектор недоступен.
+    """
+    try:
+        # Пытаемся использовать гибридный детектор
+        from hybrid_account_detector import HybridAccountDetector
+        detector = HybridAccountDetector()
+        
+        # Безопасно обрабатываем разные типы данных
+        if isinstance(item_details, list):
+            item_details = " ".join(str(item) for item in item_details)
+        elif not isinstance(item_details, str):
+            item_details = str(item_details) if item_details is not None else ""
+        
+        # Используем гибридный детектор
+        category, confidence, source = detector.detect_account_hybrid(
+            text=full_text or item_details,
+            supplier_name=supplier_name,
+            product_description=item_details
+        )
+        
+        print(f"🎯 Гибридный детектор: {category} (confidence: {confidence:.2f}, source: {source})")
+        return category
+        
+    except ImportError:
+        print("⚠️ Гибридный детектор недоступен, используем простой словарь")
+        # Fallback к старой логике
+        if isinstance(item_details, list):
+            item_details = " ".join(str(item) for item in item_details)
+        elif not isinstance(item_details, str):
+            item_details = str(item_details) if item_details is not None else ""
+        
+        item_lower = item_details.lower()
+        if "consulting" in item_lower or "consultant" in item_lower:
+            return "Consultant Expense"
+        for keyword, account in DESCRIPTION_TO_ACCOUNT.items():
+            if keyword in item_lower:
+                return account
+        return "Other Expenses"
 
 def process_invoice_json(data: dict, existing_bills: list[tuple[str, str]], ocr_text: str = "") -> dict:
     """
@@ -326,7 +379,8 @@ def process_invoice_json(data: dict, existing_bills: list[tuple[str, str]], ocr_
     ):
         data["bill_number"] = f"{bill_no} (the same)"
     item_details = data.get("item_details", "")
-    data["account"] = detect_account(item_details)
+    supplier_name = data.get("supplier", {}).get("name", "")
+    data["account"] = detect_account(item_details, supplier_name=supplier_name, full_text=ocr_text)
     # Гарантируем наличие поля document_type с актуальным значением
     if "document_type" not in data or not data["document_type"]:
         data["document_type"] = guess_document_type(data, ocr_text)
