@@ -162,3 +162,5 @@ if __name__ == "__main__":
     print(f"По VAT:")
     for vat, count in sorted(vat_stats.items()):
         print(f"  VAT {vat}%: {count} позиций")
+
+

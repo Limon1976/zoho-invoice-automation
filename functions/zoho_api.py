@@ -626,21 +626,35 @@ def get_warehouses(org_id: str, use_cache: bool = True) -> list:
 
 def find_branch_id(org_id: str, preferred_names: list[str]) -> Optional[str]:
     """
-    Ищет branch_id по списку возможных названий (без учета регистра/диакритики).
-    Возвращает первый найденный.
+    УСТАРЕВШАЯ ФУНКЦИЯ - используйте BranchManager.find_branch_by_names()
+    
+    Ищет branch_id по списку возможных названий, но ТОЛЬКО среди АКТИВНЫХ веток.
+    Возвращает первый найденный активный branch.
     """
     try:
         import unicodedata
         def norm(s: str) -> str:
             return unicodedata.normalize('NFKD', (s or '')).encode('ascii', 'ignore').decode('ascii').strip().lower()
         targets = [norm(n) for n in preferred_names if n]
+        
+        # Фильтруем только активные ветки
         for b in get_branches(org_id):
+            # Проверяем активность ветки
+            is_active = b.get("is_branch_active", False) or b.get("branch_status") == "active"
+            if not is_active:
+                continue  # Пропускаем неактивные ветки
+            
             name = b.get("name") or b.get("branch_name") or ""
             if norm(name) in targets or any(t in norm(name) for t in targets):
-                return b.get("branch_id")
-    except Exception:
+                branch_id = b.get("branch_id")
+                print(f"✅ Найдена АКТИВНАЯ ветка: {name} (ID: {branch_id})")
+                return branch_id
+        
+        print(f"⚠️ Не найдена активная ветка среди: {preferred_names}")
         return None
-    return None
+    except Exception as e:
+        print(f"❌ Ошибка поиска активной ветки: {e}")
+        return None
 
 def find_warehouse_id(org_id: str, preferred_names: list[str]) -> Optional[str]:
     """
@@ -834,23 +848,72 @@ def get_contact_by_name(contact_name: str, org_id: str) -> dict:
         if c_norm == target_norm:
             best = c
             break
-    if not best and contacts:
-        best = contacts[0]
     if best:
         contact_id = best["contact_id"]
-        log_message(f"⚠️ Найдено частичное совпадение: {best['contact_name']} (ID: {contact_id})")
+        log_message(f"✅ Найдено точное совпадение: {best['contact_name']} (ID: {contact_id})")
         full_contact = get_contact_details(org_id, contact_id)
         if full_contact:
             full_contact['vat_number'] = extract_vat_from_contact(full_contact)
             return full_contact
     
-    log_message(f"❌ Контакт '{contact_name}' не найден")
+    # Если точного совпадения нет - контакт НЕ НАЙДЕН
+    log_message(f"❌ Контакт '{contact_name}' не найден в Zoho (точное совпадение не найдено)")
     return None
 
 def get_contact_by_vat(vat_number: str, org_id: str) -> dict:
     """
-    Ищет контакт по VAT номеру в Zoho Books API.
-    Поскольку VAT хранится в custom_fields, получаем все контакты и ищем по VAT.
+    ОПТИМИЗИРОВАННЫЙ поиск контакта по VAT номеру через кэш.
+    Заменяет медленный API перебор на быстрый кэш поиск (секунды вместо минут).
+    """
+    if not vat_number:
+        return None
+        
+    def _clean(s: str) -> str:
+        return re.sub(r"[^A-Z0-9]", "", (s or '').upper())
+    vat_clean = _clean(vat_number)
+    log_message(f"🚀 Быстрый поиск VAT по кэшу: '{vat_clean}' в org_id={org_id}")
+    
+    try:
+        # Используем оптимизированный кэш для поиска
+        import sys
+        from pathlib import Path
+        sys.path.append(str(Path(__file__).parent.parent))
+        from src.domain.services.contact_cache import OptimizedContactCache
+        
+        # Определяем файл кэша для организации
+        if org_id == "20082562863":  # PARKENTERTAINMENT
+            cache_file = "data/optimized_cache/PARKENTERTAINMENT_optimized.json"
+        elif org_id == "772348639":  # TaVie Europe
+            cache_file = "data/optimized_cache/TAVIE_EUROPE_optimized.json"
+        else:
+            cache_file = "data/optimized_cache/all_contacts_optimized.json"
+        
+        # Загружаем кэш и ищем по VAT
+        cache = OptimizedContactCache(cache_file)
+        contact_entry = cache.search_by_vat(vat_number)
+        
+        if contact_entry:
+            log_message(f"✅ Найден в кэше: {contact_entry.contact_name} (ID: {contact_entry.contact_id})")
+            # Получаем полную информацию через API (быстро, т.к. знаем ID)
+            full_contact = get_contact_details(org_id, contact_entry.contact_id)
+            if full_contact:
+                # Добавляем VAT номер если не было
+                full_contact['vat_number'] = contact_entry.vat_number
+                return full_contact
+        
+        log_message(f"❌ Контакт с VAT '{vat_clean}' не найден в кэше")
+        return None
+        
+    except Exception as e:
+        log_message(f"⚠️ Ошибка при поиске в кэше: {e}")
+        log_message("🔄 Fallback к старому методу API поиска...")
+        # Fallback к старому методу если кэш не работает
+        return _get_contact_by_vat_api_fallback(vat_number, org_id)
+
+def _get_contact_by_vat_api_fallback(vat_number: str, org_id: str) -> dict:
+    """
+    Fallback метод: медленный поиск через API (для совместимости).
+    Используется только если кэш недоступен.
     """
     access_token = get_access_token()
     headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
@@ -865,7 +928,7 @@ def get_contact_by_vat(vat_number: str, org_id: str) -> dict:
     def _clean(s: str) -> str:
         return re.sub(r"[^A-Z0-9]", "", (s or '').upper())
     vat_clean = _clean(vat_number)
-    log_message(f"🔍 Поиск контакта по VAT: '{vat_clean}' в org_id={org_id}")
+    log_message(f"🐌 МЕДЛЕННЫЙ API поиск VAT: '{vat_clean}' в org_id={org_id}")
     
     # Поиск по страницам (пока не найдем или не закончатся страницы)
     while True:

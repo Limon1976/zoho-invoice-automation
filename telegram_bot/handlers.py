@@ -1544,17 +1544,16 @@ async def handle_smart_create_bill(update: Update, context: ContextTypes.DEFAULT
                     flower_lines = []
                     skip_flower_processing = False
                 
-                # 3) Если всё ещё мало позиций — пробуем Assistants API
+                # 3) Если всё ещё мало позиций — пробуем Assistants API (НО БЕЗ ПОВТОРНОГО OCR!)
                 if len(flower_lines) < 15:  # Ожидаем 27, если < 15 то пробуем API
                     try:
                         if processed_path:
                             logger.info(f"🌸 DEBUG: Пробуем Assistants API для улучшения (текущие позиции: {len(flower_lines)})")
-                            assistant_data = analyze_proforma_via_agent(processed_path)
-                            ai_flower_lines = assistant_data.get('flower_lines') or []
-                            logger.info(f"🌸 DEBUG: Assistants API нашел {len(ai_flower_lines)} позиций")
-                            if len(ai_flower_lines) > len(flower_lines):
-                                print(f"🌸 DEBUG: Assistants API лучше! Используем его результат")
-                                flower_lines = ai_flower_lines
+                            logger.info(f"🔧 DEBUG: ОТКЛЮЧЕН Assistants API чтобы избежать двойного OCR - используем уже извлеченные данные")
+                            # ВРЕМЕННО ОТКЛЮЧЕНО: assistant_data = analyze_proforma_via_agent(processed_path)
+                            # Причина: избегаем двойного Google Vision OCR (уже был сделан в начале)
+                            ai_flower_lines = []
+                            logger.info(f"🌸 DEBUG: Assistants API пропущен (избегаем двойной OCR)")
                     except Exception as e:
                         print(f"🌸 DEBUG: Assistants API failed: {e}")
             except Exception:
@@ -1585,11 +1584,16 @@ async def handle_smart_create_bill(update: Update, context: ContextTypes.DEFAULT
         occ_names = any(k in txt_lower for k in [
             'dahl', 'mondial', 'ruscus', 'gypsophila', 'alstr', 'tana', 'helian', 'delph'
         ])
-        # Цветы определяем только по LLM-категории/выявленным названиям цветов
+        # Цветы определяем по LLM-категории/выявленным названиям цветов + поставщики цветов
         llm_cat = (analysis.get('product_category') or analysis.get('document_category') or '').upper()
         detected_flower_names = analysis.get('detected_flower_names') or []
-        print(f"🌸 DEBUG: В create_bill - llm_cat='{llm_cat}', detected_flower_names={len(detected_flower_names)} шт")
-        is_flowers_doc = bool(flower_lines) or (llm_cat == 'FLOWERS' and bool(detected_flower_names))
+        supplier_name = (analysis.get('supplier_name') or '').lower()
+        
+        # 🌸 ИСПРАВЛЕНИЕ: HIBISPOL всегда цветочный поставщик
+        is_hibispol_flower_supplier = 'hibispol' in supplier_name
+        
+        print(f"🌸 DEBUG: В create_bill - llm_cat='{llm_cat}', detected_flower_names={len(detected_flower_names)} шт, hibispol={is_hibispol_flower_supplier}")
+        is_flowers_doc = bool(flower_lines) or (llm_cat == 'FLOWERS' and bool(detected_flower_names)) or is_hibispol_flower_supplier
 
         print(f"🌸 DEBUG: Итого flower_lines найдено: {len(flower_lines)}")
         
@@ -1754,7 +1758,15 @@ async def handle_smart_create_bill(update: Update, context: ContextTypes.DEFAULT
             except Exception:
                 rate = None
             if rate is None:
-                rate = float(analysis.get('total_amount') or 0)
+                # ИСПРАВЛЕНИЕ: использовать ЕДИНИЧНЫЕ цены, а не общие суммы для rate
+                if inclusive:
+                    # Для INCLUSIVE налог УЖЕ включён в единичную цену → используем unit_price_brutto
+                    rate = float(analysis.get('unit_price_brutto') or analysis.get('gross_amount') or analysis.get('total_amount') or 0)
+                    logger.info(f"🔧 FALLBACK INCLUSIVE: rate={rate} (unit_price_brutto - налог уже включён)")
+                else:
+                    # Для EXCLUSIVE налог НЕ включён в единичную цену → используем unit_price_netto
+                    rate = float(analysis.get('unit_price_netto') or analysis.get('net_amount') or analysis.get('total_amount') or 0)
+                    logger.info(f"🔧 FALLBACK EXCLUSIVE: rate={rate} (unit_price_netto - Zoho добавит налог)")
             item = {"name": desc[:200], "description": desc[:2000], "quantity": 1, "rate": rate}
             line_items.append(item)
 
@@ -1819,45 +1831,81 @@ async def handle_smart_create_bill(update: Update, context: ContextTypes.DEFAULT
         # Branch (для PARKENTERTAINMENT цветы)
         llm_cat = (analysis.get('product_category') or analysis.get('document_category') or '').upper()
         detected_flower_names = analysis.get('detected_flower_names') or []
-        is_flowers_doc = bool(flower_lines) or (llm_cat == 'FLOWERS' and bool(detected_flower_names))
-        # Определяем branch_id согласно правилам пользователя
+        supplier_name = (analysis.get('supplier_name') or '').lower()
+        
+        # 🌸 ИСПРАВЛЕНИЕ: HIBISPOL всегда цветочный поставщик  
+        is_hibispol_flower_supplier = 'hibispol' in supplier_name
+        
+        is_flowers_doc = bool(flower_lines) or (llm_cat == 'FLOWERS' and bool(detected_flower_names)) or is_hibispol_flower_supplier
+        
+        # Определяем branch_id с помощью нового BranchManager
         branch_id = None
+        branch_reason = ""
+        
         if org_id == '20082562863':  # PARKENTERTAINMENT
-            doc_text_full = (analysis.get('extracted_text') or '').lower()
-            supplier_address = (analysis.get('supplier_address') or '').lower()
-            
-            if is_flowers_doc:
-                # Для цветочных документов: определяем branch по поставщику и маркерам
-                supplier_name = (analysis.get('supplier_name') or '').lower()
+            try:
+                # Используем новый BranchManager для умного выбора веток
+                from src.domain.services.branch_manager import BranchManager
+                from functions.zoho_api import get_access_token
                 
-                if 'hibispol' in supplier_name and ('wileńska' in doc_text_full or 'wileńska' in supplier_address or 'praga' in doc_text_full or 'praga' in supplier_address):
-                    preferred = ["Wileńska"]
-                    logger.info("🌸 DEBUG: HIBISPOL + Wileńska/Praga маркер → branch Wileńska")
-                elif 'browary' in doc_text_full or 'browary' in supplier_address:
-                    preferred = ["Iris flowers atelier"] 
-                    logger.info("🌸 DEBUG: Обнаружен маркер Browary → branch Iris flowers atelier")
-                elif 'hibispol' in supplier_name:
-                    # Hibispol без явных маркеров - все равно Wileńska
-                    preferred = ["Wileńska"]
-                    logger.info("🌸 DEBUG: HIBISPOL (без маркеров) → branch Wileńska")
+                access_token = get_access_token()
+                branch_manager = BranchManager(access_token)
+                
+                if is_flowers_doc:
+                    # Умный выбор ветки для цветочных документов
+                    doc_text_full = analysis.get('extracted_text') or ''
+                    branch_id, branch_reason = branch_manager.get_branch_for_flower_document(
+                        org_id, supplier_name, doc_text_full
+                    )
+                    logger.info(f"🌸 SMART BRANCH: {branch_reason}")
                 else:
-                    # Остальные цветочные поставщики → Iris flowers atelier по умолчанию
-                    preferred = ["Iris flowers atelier"]
-                    logger.info("🌸 DEBUG: Цветочный документ (не Hibispol) → branch Iris flowers atelier")
-                
-                branch_id = find_branch_id(org_id, preferred)
+                    # Для остальных документов - Head Office
+                    head_office = branch_manager.get_head_office(org_id)
+                    if head_office:
+                        branch_id = head_office.branch_id
+                        branch_reason = f"Head Office: {head_office.name}"
+                        logger.info(f"🏢 HEAD OFFICE: {head_office.name}")
+                    
                 if branch_id:
-                    logger.info(f"🌸 DEBUG: Найден branch_id: {branch_id}")
+                    logger.info(f"✅ BRANCH MANAGER: Выбрана ветка {branch_id} ({branch_reason})")
                 else:
-                    logger.info("🌸 DEBUG: Branch не найден - покажем диалог выбора")
-                    # Если branch не найден, показываем диалог выбора
-                    branch_id = None
-            else:
-                # Для остальных документов - head office
-                preferred = ["head office"]
-                branch_id = find_branch_id(org_id, preferred)
-                if not branch_id:
-                    logger.info("🏢 DEBUG: Branches не найдены в Zoho - используем default офис")
+                    logger.warning(f"⚠️ BRANCH MANAGER: Не найдена подходящая ветка ({branch_reason})")
+                    
+            except Exception as e:
+                logger.error(f"❌ Ошибка BranchManager: {e}")
+                logger.info("🔄 Fallback к старой логике поиска веток...")
+                
+                # Fallback к старой логике (но с фильтрацией активных)
+                doc_text_full = (analysis.get('extracted_text') or '').lower()
+                supplier_address = (analysis.get('supplier_address') or '').lower()
+                
+                if is_flowers_doc:
+                    supplier_name_lower = (analysis.get('supplier_name') or '').lower()
+                    
+                    if 'hibispol' in supplier_name_lower and ('wileńska' in doc_text_full or 'wileńska' in supplier_address or 'praga' in doc_text_full or 'praga' in supplier_address):
+                        preferred = ["Wileńska"]
+                        logger.info("🌸 FALLBACK: HIBISPOL + Wileńska/Praga маркер → branch Wileńska")
+                    elif 'browary' in doc_text_full or 'browary' in supplier_address:
+                        preferred = ["Iris flowers atelier"] 
+                        logger.info("🌸 FALLBACK: Обнаружен маркер Browary → branch Iris flowers atelier")
+                    elif 'hibispol' in supplier_name_lower:
+                        preferred = ["Wileńska"]
+                        logger.info("🌸 FALLBACK: HIBISPOL (без маркеров) → branch Wileńska")
+                    else:
+                        preferred = ["Iris flowers atelier"]
+                        logger.info("🌸 FALLBACK: Цветочный документ (не Hibispol) → branch Iris flowers atelier")
+                    
+                    branch_id = find_branch_id(org_id, preferred)
+                    branch_reason = f"Fallback поиск: {preferred}"
+                else:
+                    preferred = ["head office"]
+                    branch_id = find_branch_id(org_id, preferred)
+                    branch_reason = f"Fallback Head Office: {preferred}"
+                
+                if branch_id:
+                    logger.info(f"🌸 FALLBACK: Найден branch_id: {branch_id}")
+                else:
+                    logger.info("🌸 FALLBACK: Branch не найден - покажем диалог выбора")
 
         # Inclusive tax уже определён выше по маркерам/линиям
         
@@ -1886,7 +1934,7 @@ async def handle_smart_create_bill(update: Update, context: ContextTypes.DEFAULT
             logger.info("🌸 DEBUG: Branch_id не передан - используем Head Office")
         bill_payload["is_inclusive_tax"] = bool(inclusive)
 
-        # Если branch не определен для цветочных документов - показываем диалог выбора
+        # Если branch не определен для цветочных документов - показываем диалог выбора ТОЛЬКО активных веток
         if is_flowers_doc and not branch_id and org_id == '20082562863':
             logger.info("🌸 DEBUG: Показываем диалог выбора branch для цветочного документа")
             
@@ -1894,17 +1942,21 @@ async def handle_smart_create_bill(update: Update, context: ContextTypes.DEFAULT
             context.user_data['pending_bill_payload'] = bill_payload
             context.user_data['pending_analysis'] = analysis
             
-            # Создаем клавиатуру выбора branch
+            # Создаем клавиатуру выбора ТОЛЬКО активных веток (обновлено 17.08.2025)
+            # Head Office (281497000000355003) - АКТИВНЫЙ (PRIMARY)
+            # Iris Flowers & Wine (281497000004535005) - АКТИВНЫЙ
+            # Iris flowers atelier (281497000000355063) - АКТИВНЫЙ  
+            # НЕ включаем неактивные: Wileńska, Iris Flowers Arkadia
             branch_keyboard = [
-                [InlineKeyboardButton("🏢 Head Office", callback_data="choose_branch_281497000000355003")],
-                [InlineKeyboardButton("🌸 Iris flowers atelier", callback_data="choose_branch_281497000000355063")], 
-                [InlineKeyboardButton("🏪 Wileńska", callback_data="choose_branch_281497000002901751")]
+                [InlineKeyboardButton("✅ Head Office (primary)", callback_data="choose_branch_281497000000355003")],
+                [InlineKeyboardButton("✅ Iris Flowers & Wine", callback_data="choose_branch_281497000004535005")],
+                [InlineKeyboardButton("✅ Iris flowers atelier", callback_data="choose_branch_281497000000355063")]
             ]
             reply_markup = InlineKeyboardMarkup(branch_keyboard)
             
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text="🌸 Выберите branch для цветочного документа:",
+                text="🌸 Выберите АКТИВНУЮ ветку для цветочного документа:\n\n⚠️ Показаны только активные ветки",
                 reply_markup=reply_markup
             )
             return
@@ -1968,18 +2020,29 @@ async def handle_smart_create_bill(update: Update, context: ContextTypes.DEFAULT
         bill = data['bill']
         bill_id = bill.get('bill_id')
 
-        # Прикрепляем PDF
+        # Прикрепляем PDF к созданному билlu
         if processed_path and os.path.exists(processed_path):
+            logger.info(f"📎 Прикрепляем файл {processed_path} к bill {bill_id}")
             attach_url = f"https://www.zohoapis.eu/books/v3/bills/{bill_id}/attachment?organization_id={org_id}"
-            files = {"attachment": open(processed_path, 'rb')}
-            headers_att = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+            
             try:
-                requests.post(attach_url, headers=headers_att, files=files)
-            finally:
-                try:
-                    files["attachment"].close()
-                except Exception:
-                    pass
+                with open(processed_path, 'rb') as pdf_file:
+                    files = {"attachment": pdf_file}
+                    headers_att = {"Authorization": f"Zoho-oauthtoken {access_token}"}
+                    
+                    attach_response = requests.post(attach_url, headers=headers_att, files=files)
+                    logger.info(f"📎 ATTACH response: status={attach_response.status_code}")
+                    
+                    if attach_response.status_code in [200, 201]:
+                        logger.info(f"✅ Файл успешно прикреплен к билlu (статус {attach_response.status_code})")
+                        logger.info(f"📎 Ответ прикрепления: {attach_response.text}")
+                    else:
+                        logger.error(f"❌ Ошибка прикрепления файла: {attach_response.status_code} - {attach_response.text}")
+                        
+            except Exception as attach_error:
+                logger.error(f"❌ Исключение при прикреплении файла: {attach_error}")
+        else:
+            logger.warning(f"⚠️ Файл не найден для прикрепления: {processed_path}")
 
         # Сообщение об успехе с кнопкой «Открыть в Zoho»
         open_url = f"https://books.zoho.eu/app/{org_id}#/bills/{bill_id}?filter_by=Status.All&per_page=200&sort_column=date&sort_order=D"

@@ -483,7 +483,7 @@ class SupplierContactCreator:
                 remarks_parts.append(supplier_data['iban'])
             elif supplier_data.get("bank_account"):
                 remarks_parts.append(supplier_data['bank_account'])
-                logger.info(f"🏦 Добавляем IBAN: {supplier_data['iban']}")
+                logger.info(f"🏦 Добавляем банковский счет: {supplier_data['bank_account']}")
             if supplier_data.get("swift_bic"):
                 remarks_parts.append(supplier_data['swift_bic'])
                 logger.info(f"🏦 Добавляем SWIFT: {supplier_data['swift_bic']}")

@@ -304,45 +304,23 @@ def force_clean_item_details_and_account(data):
 
 def detect_account(item_details: str, supplier_name: str = "", full_text: str = "") -> str:
     """
-    Интеллектуальное определение категории с использованием гибридного детектора.
-    Fallback к простому словарю если гибридный детектор недоступен.
+    Определение категории расходов на основе описания товара/услуги.
+    Использует словарь ключевых слов для категоризации.
     """
-    try:
-        # Пытаемся использовать гибридный детектор
-        from hybrid_account_detector import HybridAccountDetector
-        detector = HybridAccountDetector()
-        
-        # Безопасно обрабатываем разные типы данных
-        if isinstance(item_details, list):
-            item_details = " ".join(str(item) for item in item_details)
-        elif not isinstance(item_details, str):
-            item_details = str(item_details) if item_details is not None else ""
-        
-        # Используем гибридный детектор
-        category, confidence, source = detector.detect_account_hybrid(
-            text=full_text or item_details,
-            supplier_name=supplier_name,
-            product_description=item_details
-        )
-        
-        print(f"🎯 Гибридный детектор: {category} (confidence: {confidence:.2f}, source: {source})")
-        return category
-        
-    except ImportError:
-        print("⚠️ Гибридный детектор недоступен, используем простой словарь")
-        # Fallback к старой логике
-        if isinstance(item_details, list):
-            item_details = " ".join(str(item) for item in item_details)
-        elif not isinstance(item_details, str):
-            item_details = str(item_details) if item_details is not None else ""
-        
-        item_lower = item_details.lower()
-        if "consulting" in item_lower or "consultant" in item_lower:
-            return "Consultant Expense"
-        for keyword, account in DESCRIPTION_TO_ACCOUNT.items():
-            if keyword in item_lower:
-                return account
-        return "Other Expenses"
+    # Безопасно обрабатываем разные типы данных
+    if isinstance(item_details, list):
+        item_details = " ".join(str(item) for item in item_details)
+    elif not isinstance(item_details, str):
+        item_details = str(item_details) if item_details is not None else ""
+    
+    # Используем простую логику на основе ключевых слов
+    item_lower = item_details.lower()
+    if "consulting" in item_lower or "consultant" in item_lower:
+        return "Consultant Expense"
+    for keyword, account in DESCRIPTION_TO_ACCOUNT.items():
+        if keyword in item_lower:
+            return account
+    return "Other Expenses"
 
 def process_invoice_json(data: dict, existing_bills: list[tuple[str, str]], ocr_text: str = "") -> dict:
     """

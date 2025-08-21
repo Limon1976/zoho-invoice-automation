@@ -207,3 +207,5 @@ def convert_to_zoho_format(positions):
         
     logger.info(f"🌸 PDFPlumber: Конвертировано {len(zoho_items)} позиций для Zoho")
     return zoho_items
+
+
