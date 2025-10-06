@@ -1397,6 +1397,9 @@ def analyze_proforma_via_agent(file_path: str) -> dict:
         
         # 1) Пытаемся извлечь поля через GPT-4 (function-calling JSON)
         data = llm_extract_fields(ocr_text) or {}
+        
+        # КРИТИЧЕСКИ ВАЖНО: сохраняем OCR текст в extracted_text для логики inclusive/exclusive
+        data['extracted_text'] = ocr_text
         # Если это потенциально «цветочный» документ — параллельно включаем проверку через Assistants API
         looks_flower = any(k in (ocr_text or '').lower() for k in ["kwiat", "kwiaty", "flowers", "róża", "tulip", "stawka vat", "cena brutto"]) 
         if looks_flower:

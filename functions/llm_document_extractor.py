@@ -23,7 +23,15 @@ def _get_client() -> Optional[Any]:
 
 _EXTRACT_SYSTEM = (
     "You are a precise information extractor for invoices, proformas, purchase orders, and contracts. "
-    "Output a compact JSON following the schema. Never include prose outside JSON."
+    "Output a compact JSON following the schema. Never include prose outside JSON. "
+    "CRITICAL: Accurately classify document_type based on content structure and purpose:\n"
+    "- 'receipt' for retail receipts/парагоны фискальные (PARAGON FISKALNY, retail purchases, cash register receipts)\n"
+    "- 'invoice' for formal B2B invoices/счета-фактуры (FAKTURA, INVOICE, RECHNUNG)\n"
+    "- 'proforma' for advance/preliminary invoices (PROFORMA, PRO-FORMA)\n"
+    "- 'contract' for agreements/contracts (CONTRACT, UMOWA, AGREEMENT)\n"
+    "- 'credit_note' for credit notes/returns (CREDIT NOTE, NOTA KREDYTOWA)\n"
+    "IMPORTANT: For vehicle documents, always extract VIN/chassis number (usually 17 characters alphanumeric), "
+    "car brand, model, and year. Look for terms like 'VIN', 'Chassis', 'Fahrgestellnummer', 'Nr podwozia'."
 )
 
 _EXTRACT_SCHEMA = {
@@ -35,7 +43,7 @@ _EXTRACT_SCHEMA = {
         "supplier_phone": {"type": "string"},
         "supplier_email": {"type": "string"},
         "vat": {"type": "string"},
-        "document_type": {"type": "string", "description": "one of: contract_sale, proforma_invoice, invoice, service_invoice, delivery_note"},
+        "document_type": {"type": "string", "description": "CRITICAL: one of: receipt (for PARAGON FISKALNY/retail receipts), invoice (for B2B invoices/FAKTURA), proforma (for advance invoices), contract (for agreements), credit_note (for returns), delivery_note, other"},
         "bill_number": {"type": "string"},
         "date": {"type": "string"},
         "vin": {"type": "string"},
@@ -62,11 +70,30 @@ _EXTRACT_SCHEMA = {
         "car_year": {"type": "string"},
         "item_description": {"type": "string", "description": "Concise English description of the car including notable features if present"},
         "service_description": {"type": "string", "description": "If this is a service invoice, short description of the service (in English)"},
-        "issue_date": {"type": "string", "description": "The document issue date if explicitly present"},
+        "issue_date": {"type": "string", "description": "The document issue date (Data wystawienia) if explicitly present"},
+        "sale_date": {"type": "string", "description": "The sale/service date (Data sprzedaży) if explicitly present - PREFERRED for bill_date"},
         "due_date": {"type": "string", "description": "The due date/payment due if explicitly present"},
         "car_features": {"type": "array", "items": {"type": "string"}},
-        "product_category": {"type": "string", "description": "One of: FLOWERS, CARS, SERVICES, UTILITIES, FOOD, OTHER"},
+        "product_category": {"type": "string", "description": "One of: FLOWERS (cut flowers, bouquets, floral arrangements), CARS (vehicles, automotive), SERVICES (consulting, maintenance, subscriptions), UTILITIES (electricity, water, gas, internet), FOOD (food products, catering), OTHER (general goods, equipment, supplies)"},
         "detected_flower_names": {"type": "array", "items": {"type": "string"}},
+        "line_items": {
+            "type": "array", 
+            "description": "Extract all line items/positions from the document, including main items and additional services (e.g., from 'Informacja dodatkowa do faktury')",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "Item description in Polish"},
+                    "description_en": {"type": "string", "description": "Item description translated to English"},
+                    "quantity": {"type": "number", "description": "Quantity (default 1 if not specified)"},
+                    "unit": {"type": "string", "description": "Unit (szt., kg, etc.)"},
+                    "net_amount": {"type": "number", "description": "Net amount without VAT"},
+                    "vat_rate": {"type": "number", "description": "VAT rate percentage (0, 8, 23, etc.)"},
+                    "vat_amount": {"type": "number", "description": "VAT amount"},
+                    "gross_amount": {"type": "number", "description": "Gross amount with VAT"},
+                    "is_additional": {"type": "boolean", "description": "True if from 'Informacja dodatkowa' section"}
+                }
+            }
+        },
         # Structured supplier address to avoid city/zip mixing
         "supplier_address_struct": {
             "type": "object",
@@ -108,14 +135,35 @@ def llm_extract_fields(ocr_text: str) -> Dict[str, Any]:
             " 3) Fill issuer_name/issuer_vat from seller_name/seller_vat for backward compatibility."
             " 4) Prefer NET amounts for 'total_amount'. If only gross and VAT are present, set net_amount = gross_amount - vat_amount;"
             " if only gross and tax_rate are present, estimate net_amount = round(gross_amount / (1 + tax_rate/100), 2)."
-            " 5) Produce supplier_address_struct (street, city, zip, country) if possible to avoid mixing city/zip into address lines.\n\n"
+            " 5) Produce supplier_address_struct (street, city, zip, country) if possible to avoid mixing city/zip into address lines."
+            " 6) MANDATORY: Extract ALL line items from the document into the 'line_items' array. This includes main items AND additional services from 'Informacja dodatkowa do faktury' sections. Each line item must have description, net_amount, and other relevant fields."
+            " 7) CRITICAL FOR POLISH INVOICES WITH TABLES: Look for table rows with structure 'Service description | Net amount | VAT rate | VAT amount | Gross amount'. Each table row = separate line_item. Do NOT aggregate or combine rows."
+            " 8) POLISH INVOICE TABLE STRUCTURE: Polish invoices have scrambled table data. Look for these patterns:"
+            "    - Service descriptions: 'Usługi wg stawek VAT', 'Rozliczenie dodatkowe'"
+            "    - Net amounts appear in sequence: 151,07 then 12,76 then 1,21"
+            "    - VAT rates appear as: 23% then 8% (Rozliczenie has no VAT)"
+            "    - VAT amounts: 34,75 then 1,02 (Rozliczenie has no VAT amount)"
+            " 9) EXTRACT RULE: Match service descriptions with amounts in order:"
+            "    - 1st 'Usługi wg stawek VAT' → net_amount: 151.07, vat_rate: 23, vat_amount: 34.75"
+            "    - 2nd 'Usługi wg stawek VAT' → net_amount: 12.76, vat_rate: 8, vat_amount: 1.02"  
+            "    - 'Rozliczenie dodatkowe' → net_amount: 1.21, vat_rate: 0, vat_amount: 0"
+            " 9) MULTIPLE VAT RATES: Create separate line_items for each table row with its exact net_amount from that specific row."
+            " 7) For PARAGON FISKALNY receipts: CRITICAL parsing rules:"
+            "    - Look for patterns: 'ITEM_NAME\\n5 *' followed by unit price (e.g., '12,99')"
+            "    - Extract quantity from standalone numbers followed by '*' (e.g., '5 *' = quantity 5)"
+            "    - Extract unit price from the price after '*' symbol"
+            "    - Calculate line total: quantity × unit_price"
+            "    - For gross_amount: use the calculated line total (quantity × unit_price)"
+            "    - For net_amount: calculate from gross_amount - VAT portion"
+            "    - Example: 'PUDŁO\\n5 *\\n12,99' = qty:5, unit_price:12.99, gross_amount:64.95"
+            " 8) For Polish receipts: Look for 'SUMA PLN' as total_amount. Extract VAT rate from 'PTU A 23,00%'. Parse line structure carefully.\n\n"
             f"{json.dumps(_EXTRACT_SCHEMA)}\n\n"
             "Text:\n" + ocr_text[:16000]
         )
         resp = client.chat.completions.create(
             model=os.getenv("OPENAI_GPT4_MODEL", "gpt-4o"),
             messages=[
-                {"role": "system", "content": _EXTRACT_SYSTEM + " Also classify product_category. If the items are cut flowers/flower goods, set product_category=FLOWERS and list detected_flower_names (e.g., rose, tulip, gypsophila, ruscus, alstroemeria, chrysanthemum; use Latin/English/Polish names). If it's a service invoice, fill service_description in clear English including the billing period (e.g., 'Basic monthly subscription for August 2025' or 'IT services for July-August 2025'). If dates like 'Date of issue' or 'Due date' exist, set issue_date and due_date respectively."},
+                {"role": "system", "content": _EXTRACT_SYSTEM + " Also classify product_category carefully based on the actual items in the document. If the items are cut flowers/flower goods, set product_category=FLOWERS and list detected_flower_names (e.g., rose, tulip, gypsophila, ruscus, alstroemeria, chrysanthemum; use Latin/English/Polish names). If it's a service invoice, fill service_description in clear English including the billing period (e.g., 'Basic monthly subscription for August 2025' or 'IT services for July-August 2025'). If it's automotive/vehicle related, set product_category=CARS. If it's utilities (electricity, water, gas, internet), set product_category=UTILITIES. If it's food products, set product_category=FOOD. Only use OTHER for general goods/equipment when no specific category fits. IMPORTANT: Extract dates carefully - 'Data wystawienia' or 'Date of issue' → issue_date, 'Data sprzedaży' or 'Sale date' → sale_date, 'Termin płatności' or 'Due date' → due_date. Always prefer sale_date over issue_date for bill_date. CRITICAL: Extract ALL line items from the document, including main positions AND any additional services from sections like 'Informacja dodatkowa do faktury'. If 'Informacja dodatkowa' contains items with amounts (Kwota), include them as separate line_items. For VAT rates, extract from document context or use 0% if not specified for additional items. MANDATORY: Always populate the 'line_items' array with ALL items found in the document - this is required for proper billing. Each line item must have description, net_amount, and other relevant fields."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
@@ -138,6 +186,24 @@ def llm_extract_fields(ocr_text: str) -> Dict[str, Any]:
             logger.info(f"🔍 product_category: {data['product_category']}")
         if data.get('detected_flower_names'):
             logger.info(f"🔍 detected_flower_names: {data['detected_flower_names']}")
+        if data.get('line_items'):
+            logger.info(f"🔍 line_items: {len(data['line_items'])} позиций найдено")
+            for i, item in enumerate(data['line_items']):
+                logger.info(f"  {i+1}. {item.get('description_en', item.get('description', 'N/A'))} - {item.get('net_amount', 0)} (VAT: {item.get('vat_rate', 0)}%)")
+        
+        # ДОБАВЛЕННЫЕ ЛОГИ: Автомобильные данные
+        if data.get('vin'):
+            logger.info(f"🚗 LLM VIN: '{data['vin']}'")
+        if data.get('car_brand'):
+            logger.info(f"🚗 LLM car_brand: '{data['car_brand']}'")
+        if data.get('car_model'):
+            logger.info(f"🚗 LLM car_model: '{data['car_model']}'")
+        if data.get('is_car_related'):
+            logger.info(f"🚗 LLM is_car_related: {data['is_car_related']}")
+        if data.get('item_description'):
+            logger.info(f"🚗 LLM item_description: '{data['item_description']}'")
+        if data.get('service_description'):
+            logger.info(f"🔍 LLM service_description: '{data['service_description']}'")
         
         # minimal cleanup and normalization
         if data.get("vat"):
@@ -292,6 +358,58 @@ def llm_translate_to_ru(text: str) -> str:
         return text
 
 
+def _generate_dynamic_guidelines(account_names: list[str]) -> str:
+    """Генерирует динамические guidelines на основе доступных accounts"""
+    guidelines = []
+    
+    # Проверяем какие accounts доступны и создаем соответствующие правила
+    account_names_lower = [name.lower() for name in account_names]
+    
+    # Software/SaaS subscriptions
+    if "subscriptions" in account_names_lower:
+        guidelines.append("- Software/SaaS/platform subscriptions (ChatGPT, OpenAI, SuperCMR, web platforms, IT tools) → 'Subscriptions'")
+    elif "it and internet expenses" in account_names_lower:
+        guidelines.append("- Software/SaaS/platform subscriptions (ChatGPT, OpenAI, SuperCMR, web platforms, IT tools) → 'IT and Internet Expenses'")
+    
+    # Professional services
+    if "consultant expense" in account_names_lower:
+        guidelines.append("- Professional consulting services → 'Consultant Expense'")
+    
+    # Legal services
+    if "lawyers" in account_names_lower:
+        guidelines.append("- Legal services → 'Lawyers'")
+    
+    # Utilities/telecom
+    utility_accounts = [acc for acc in account_names if any(word in acc.lower() for word in ["utility", "telephone", "telecom"])]
+    if utility_accounts:
+        utility_options = ' or '.join([f"'{acc}'" for acc in utility_accounts[:2]])
+        guidelines.append(f"- Utilities/telecom → {utility_options}")
+    
+    # Flowers
+    if "flowers" in account_names_lower:
+        guidelines.append("- Flowers/floriculture → 'Flowers'")
+    
+    # Delivery/Shipping
+    delivery_accounts = [acc for acc in account_names if any(word in acc.lower() for word in ["delivery", "shipping", "postage"])]
+    if delivery_accounts:
+        delivery_options = ' or '.join([f"'{acc}'" for acc in delivery_accounts[:2]])
+        guidelines.append(f"- Courier/postal/shipping/delivery services (NOVA POST, DHL, UPS, FedEx) → {delivery_options}")
+    
+    # Travel
+    travel_accounts = [acc for acc in account_names if any(word in acc.lower() for word in ["travel", "lodging", "automobile"])]
+    if travel_accounts:
+        travel_options = ' or '.join([f"'{acc}'" for acc in travel_accounts[:2]])
+        guidelines.append(f"- Travel/transportation expenses → {travel_options}")
+    
+    # Office supplies
+    office_accounts = [acc for acc in account_names if any(word in acc.lower() for word in ["office", "supplies", "stationery"])]
+    if office_accounts:
+        office_options = ' or '.join([f"'{acc}'" for acc in office_accounts[:2]])
+        guidelines.append(f"- Office supplies/stationery → {office_options}")
+    
+    return '\n'.join(guidelines) if guidelines else "- Choose the most appropriate account based on the expense type"
+
+
 def llm_select_account(account_names: list[str], context_text: str, supplier_name: str = "", category: str = "") -> Dict[str, Any]:
     """Ask LLM to pick the best expense account from a provided list. Returns {name, confidence}.
     If LLM unavailable, returns {}.
@@ -301,16 +419,14 @@ def llm_select_account(account_names: list[str], context_text: str, supplier_nam
         return {}
     try:
         schema = {"type": "object", "properties": {"name": {"type": "string"}, "confidence": {"type": "number"}}}
+        
+        # ДИНАМИЧЕСКИЕ GUIDELINES: адаптируем под доступные accounts
+        guidelines = _generate_dynamic_guidelines(account_names)
+        
         prompt = (
             "Choose the best matching expense account name from this list based on the document context. "
             "Return JSON with fields: name (must be EXACTLY one of the provided items) and confidence (0..1).\n\n"
-            "Guidelines:\n"
-            "- Software/SaaS/platform subscriptions (SuperCMR, web platforms, IT tools) → 'IT and Internet Expenses' or 'Subscriptions'\n"
-            "- Professional consulting services → 'Consultant Expense'\n"
-            "- Legal services → 'Lawyers'\n"
-            "- Utilities/telecom → 'Utility Expenses' or 'Telephone Expense'\n"
-            "- Flowers/floriculture → 'Flowers'\n"
-            "- Courier/postal/shipping/delivery services (NOVA POST, DHL, UPS, FedEx) → 'Delivery' or 'Shipping Charge'\n\n"
+            f"Guidelines:\n{guidelines}\n"
             f"Accounts: {account_names}\n"
             f"Supplier: {supplier_name}\n"
             f"Category hint: {category}\n"

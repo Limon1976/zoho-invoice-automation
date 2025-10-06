@@ -185,6 +185,36 @@ result = await sync_service.full_sync_organization("20082562863")
 
 ## 🚀 Интеграция с системой
 
+### Universal Supplier Creator (Новая универсальная функция)
+
+**Файл:** `functions/universal_supplier_creator.py`
+
+Универсальная функция для создания поставщиков из любого модуля проекта (Telegram Bot, WorkDrive Processor, Universal Document Processor).
+
+```python
+from functions.universal_supplier_creator import create_supplier_universal
+
+# Создание поставщика с правильным разделением адреса на поля
+supplier = await create_supplier_universal(analysis, org_id)
+```
+
+**Особенности:**
+- ✅ **Правильное разделение адреса** на поля (address, city, zip, country)
+- ✅ **Использует проверенную логику** из `contact_creator.py`
+- ✅ **Поддержка всех модулей** проекта
+- ✅ **Автоматическое определение** организации по `target_org_id`
+- ✅ **Структурированный адрес** из LLM анализа (приоритет)
+
+**Структура адреса:**
+```python
+billing_address = {
+    "address": "UL. POZNAŃSKA 98, BRONISZE",  # улица
+    "city": "OZARÓW MAZOWIECKI",              # город  
+    "zip": "05-850",                          # индекс
+    "country": "Poland"                       # страна
+}
+```
+
 ### Telegram Bot интеграция:
 ```python
 # При получении документа в телеграм
@@ -202,11 +232,37 @@ async def process_document(document_data):
         contact = response.json()["contact"]
         # Используем найденный контакт
     else:
-        # Создаем новый контакт
-        await httpx.post("/api/contacts/auto-create-from-document", json={
-            "supplier_data": supplier,
-            "organization_id": get_organization_id()
-        })
+        # Создаем новый контакт через универсальную функцию
+        supplier = await create_supplier_universal(document_data, org_id)
+```
+
+### WorkDrive Batch Processor интеграция:
+```python
+# В WorkDrive Batch Processor
+from functions.universal_supplier_creator import create_supplier_universal
+
+async def process_single_file(self, file: Dict):
+    # ... анализ документа ...
+    
+    # Создание поставщика если не найден
+    if not supplier:
+        supplier = await create_supplier_universal(analysis, org_id)
+```
+
+### Universal Document Processor интеграция:
+```python
+# В Universal Document Processor  
+from functions.universal_supplier_creator import create_supplier_universal
+
+async def find_or_create_supplier(self, analysis: Dict, org_id: str):
+    # Поиск существующего поставщика
+    supplier = self.find_supplier_in_zoho(org_id, supplier_name, supplier_vat)
+    
+    if not supplier:
+        # Создание нового через универсальную функцию
+        supplier = await create_supplier_universal(analysis, org_id)
+    
+    return supplier
 ```
 
 ### Webhook настройка:

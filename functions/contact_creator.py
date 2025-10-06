@@ -71,21 +71,82 @@ class SupplierContactCreator:
             if self._is_our_company(supplier_data):
                 return True, f"ℹ️ Пропущено: {supplier_data['name']} - это наша компания"
             
-            # Проверяем существование в кэше
-            existing_contact = await self._find_existing_contact(supplier_data)
+            # Проверяем существование в кэше ЦЕЛЕВОЙ организации
+            target_org_id = document_data.get('target_org_id')
+            existing_contact = await self._find_existing_contact(supplier_data, target_org_id)
             if existing_contact:
-                return True, f"✅ Контакт уже существует: {existing_contact.company_name} (VAT: {existing_contact.vat_number})"
+                logger.info(f"✅ КОНТАКТ НАЙДЕН: {existing_contact.company_name} (ID: {existing_contact.contact_id}, VAT: {existing_contact.vat_number})")
+                
+                # ПРОВЕРЯЕМ ЧТО ЭТО ПРАВИЛЬНЫЙ КОНТАКТ (с учетом сокращений)
+                found_name = existing_contact.company_name.strip().upper()
+                search_name = supplier_data["name"].strip().upper()
+                
+                # ТОЧНОЕ совпадение - проверяем существует ли в Zoho
+                if found_name == search_name:
+                    logger.info(f"✅ ТОЧНОЕ совпадение названий - проверяем существование в Zoho")
+                    
+                    # Проверяем существует ли контакт в Zoho API
+                    try:
+                        from functions.zoho_api import get_contact_details
+                        zoho_contact = get_contact_details(target_org_id, existing_contact.contact_id)
+                        if zoho_contact:
+                            logger.info(f"✅ Контакт существует в Zoho - используем существующий")
+                            return True, f"✅ Контакт уже существует: {existing_contact.company_name} (ID: {existing_contact.contact_id})"
+                        else:
+                            logger.warning(f"⚠️ Контакт найден в кэше, но НЕ существует в Zoho - создаем новый")
+                            # Продолжаем создание нового контакта
+                    except Exception as e:
+                        logger.warning(f"⚠️ Ошибка проверки контакта в Zoho: {e} - создаем новый")
+                        # При ошибке API - создаем новый контакт
+                
+                # ЧАСТИЧНОЕ совпадение (найденное содержится в искомом или наоборот)
+                elif found_name in search_name or search_name in found_name:
+                    # Проверяем что это НЕ случайное совпадение - минимум 70% длины
+                    min_length = min(len(found_name), len(search_name))
+                    max_length = max(len(found_name), len(search_name))
+                    
+                    if min_length / max_length >= 0.7:  # Минимум 70% совпадения
+                        logger.info(f"✅ ЧАСТИЧНОЕ совпадение названий ({min_length/max_length:.1%}) - проверяем существование в Zoho")
+                        logger.info(f"   Найден: '{found_name[:50]}...'")
+                        logger.info(f"   Ищем:   '{search_name[:50]}...'")
+                        
+                        # Проверяем существует ли контакт в Zoho API
+                        try:
+                            from functions.zoho_api import get_contact_details
+                            zoho_contact = get_contact_details(target_org_id, existing_contact.contact_id)
+                            if zoho_contact:
+                                logger.info(f"✅ Контакт существует в Zoho - используем существующий")
+                                return True, f"✅ Контакт уже существует: {existing_contact.company_name} (ID: {existing_contact.contact_id})"
+                            else:
+                                logger.warning(f"⚠️ Контакт найден в кэше, но НЕ существует в Zoho - создаем новый")
+                                # Продолжаем создание нового контакта
+                        except Exception as e:
+                            logger.warning(f"⚠️ Ошибка проверки контакта в Zoho: {e} - создаем новый")
+                            # При ошибке API - создаем новый контакт
+                
+                logger.warning(f"❌ НЕ подходящий контакт: найден '{found_name[:30]}...', ищем '{search_name[:30]}...' - создаем новый")
+                # Продолжаем создание нового контакта
             
             # Создаем новый контакт
-            success, contact_id, created_contact_data = await self._create_new_contact(supplier_data)
+            # Передаем target_org_id если есть
+            target_org_id = document_data.get('target_org_id')
+            success, contact_id, created_contact_data = await self._create_new_contact(supplier_data, target_org_id)
             if success:
                 # Обновляем кэш если он есть
                 if self.contact_cache and created_contact_data:
                     logger.info(f"🔄 Обновляем кэш после создания контакта: {supplier_data['name']}")
                     
                     # Определяем организацию для обновления кэша
-                    org_id = self._determine_organization(supplier_data["country"])
-                    org_name = "PARKENTERTAINMENT" if supplier_data["country"] == "Poland" else "TaVie Europe OÜ"
+                    # ПРИОРИТЕТ: target_org_id из document_data, иначе по стране
+                    target_org_id = document_data.get('target_org_id')
+                    if target_org_id:
+                        org_id = target_org_id
+                        org_name = "PARKENTERTAINMENT" if org_id == "20082562863" else "TaVie Europe OÜ"
+                        logger.info(f"🏢 CONTACT_CREATOR: Используем target_org_id={org_id} ({org_name})")
+                    else:
+                        org_id = self._determine_organization_by_buyer(document_data)
+                        org_name = "PARKENTERTAINMENT" if org_id == "20082562863" else "TaVie Europe OÜ"
+                        logger.info(f"🏢 CONTACT_CREATOR: Определяем по покупателю в документе → {org_name}")
                     
                     await self._refresh_cache(org_id, org_name, new_contact_data=created_contact_data)
                     logger.info(f"✅ Кэш обновлен для {org_name}, теперь можно искать: {supplier_data['name']}")
@@ -375,10 +436,57 @@ class SupplierContactCreator:
         """Проверяет, является ли компания нашей"""
         return is_our_company(supplier_data["name"], supplier_data["vat"])
     
-    async def _find_existing_contact(self, supplier_data: Dict[str, Any]) -> Optional[Any]:
-        """Ищет существующий контакт в кэше"""
+    async def _find_existing_contact(self, supplier_data: Dict[str, Any], target_org_id: Optional[str] = None) -> Optional[Any]:
+        """Ищет существующий контакт в кэше целевой организации"""
+        
+        # Если указана целевая организация, загружаем её кэш
+        if target_org_id:
+            org_name = "PARKENTERTAINMENT" if target_org_id == "20082562863" else "TaVie Europe OÜ"
+            cache_file = Path(f"data/optimized_cache/{org_name.replace(' ', '_').replace('Ü', 'U')}_optimized.json")
+            
+            if cache_file.exists():
+                target_cache = OptimizedContactCache(str(cache_file))
+                logger.info(f"🔍 FIND_CONTACT: Ищем в кэше {org_name} (target_org_id={target_org_id})")
+                
+                # Поиск по VAT (приоритет)
+                if supplier_data["vat"]:
+                    found = target_cache.search_by_vat(supplier_data["vat"])
+                    if found:
+                        logger.info(f"✅ FIND_CONTACT: Найден по VAT в {org_name}")
+                        return found
+                
+                # Поиск по названию компании (ТОЧНОЕ совпадение)  
+                if supplier_data["name"]:
+                    found = target_cache.search_by_company(supplier_data["name"])
+                    if found:
+                        # Проверяем ТОЧНОЕ совпадение названий
+                        for contact in found:
+                            if contact.company_name.strip().upper() == supplier_data["name"].strip().upper():
+                                logger.info(f"✅ FIND_CONTACT: ТОЧНОЕ совпадение по названию в {org_name}: {contact.company_name}")
+                                return contact
+                        
+                        # Если точного совпадения нет - НЕ ВОЗВРАЩАЕМ результат
+                        logger.warning(f"⚠️ FIND_CONTACT: Найдены похожие в {org_name}, но БЕЗ точного совпадения: {[c.company_name for c in found[:3]]}")
+                        return None
+                        
+                    # Поиск по email
+                    if supplier_data["email"]:
+                        found = target_cache.search_by_email(supplier_data["email"])
+                        if found:
+                            logger.info(f"✅ FIND_CONTACT: Найден по email в {org_name}")
+                            return found
+                
+                logger.info(f"❌ FIND_CONTACT: НЕ найден в {org_name}")
+            else:
+                logger.warning(f"⚠️ FIND_CONTACT: Кэш не найден для {org_name}")
+        else:
+            logger.warning(f"⚠️ FIND_CONTACT: Не указан target_org_id")
+        
+        # Fallback: поиск в общем кэше (старая логика)
         if not self.contact_cache:
             return None
+        
+        logger.info(f"🔍 FIND_CONTACT: Fallback поиск в общем кэше")
         
         # Поиск по VAT (приоритет)
         if supplier_data["vat"]:
@@ -386,11 +494,19 @@ class SupplierContactCreator:
             if found:
                 return found
         
-        # Поиск по названию компании
+        # Поиск по названию компании (ТОЧНОЕ совпадение)
         if supplier_data["name"]:
             found = self.contact_cache.search_by_company(supplier_data["name"])
             if found:
-                return found[0] if found else None
+                # Проверяем ТОЧНОЕ совпадение названий
+                for contact in found:
+                    if contact.company_name.strip().upper() == supplier_data["name"].strip().upper():
+                        logger.info(f"✅ ТОЧНОЕ совпадение по названию: {contact.company_name}")
+                        return contact
+                
+                # Если точного совпадения нет - НЕ ВОЗВРАЩАЕМ результат
+                logger.warning(f"⚠️ Найдены похожие контакты, но БЕЗ точного совпадения: {[c.company_name for c in found[:3]]}")
+                return None
         
         # Поиск по email
         if supplier_data["email"]:
@@ -400,11 +516,21 @@ class SupplierContactCreator:
         
         return None
     
-    async def _create_new_contact(self, supplier_data: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+    async def _create_new_contact(self, supplier_data: Dict[str, Any], target_org_id: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
         """Создает новый контакт в Zoho Books"""
         try:
-            # Определяем организацию по стране поставщика
-            org_id = self._determine_organization(supplier_data["country"])
+            # Определяем организацию: приоритет target_org_id, иначе по стране поставщика
+            if target_org_id:
+                org_id = target_org_id
+                logger.info(f"🏢 CREATE_CONTACT: Используем target_org_id={org_id}")
+            else:
+                # Используем страну поставщика для определения организации
+                supplier_country = supplier_data.get('country', '').lower()
+                if supplier_country in ['poland', 'polska', 'pl']:
+                    org_id = "20082562863"  # PARKENTERTAINMENT
+                else:
+                    org_id = "20092948714"  # TaVie Europe OÜ
+                logger.info(f"🏢 CREATE_CONTACT: Определяем по стране поставщика ({supplier_country}) → org_id={org_id}")
             
             # Подготавливаем данные для Zoho API
             # Company Name и Display Name должны быть одинаковыми и читаемыми
@@ -473,6 +599,25 @@ class SupplierContactCreator:
                 "shipping_address": billing_address.copy(),  # Копируем billing address в shipping
                 "custom_fields": []
             }
+            
+            # Устанавливаем валюту из документа через правильный currency_id
+            document_currency = supplier_data.get("currency") or supplier_data.get("document_currency")
+            if document_currency:
+                currency_id = self._get_currency_id_from_code(org_id, document_currency)
+                if currency_id:
+                    contact_payload["currency_id"] = currency_id
+                    logger.info(f"💰 Установлена валюта из документа: {document_currency} → currency_id: {currency_id}")
+                else:
+                    logger.warning(f"⚠️ Не удалось найти currency_id для валюты {document_currency}")
+            else:
+                # Валюту по умолчанию в зависимости от организации
+                default_currency = "PLN" if org_id == "20082562863" else "EUR"
+                currency_id = self._get_currency_id_from_code(org_id, default_currency)
+                if currency_id:
+                    contact_payload["currency_id"] = currency_id
+                    logger.info(f"💰 Установлена валюта по умолчанию: {default_currency} → currency_id: {currency_id}")
+                else:
+                    logger.warning(f"⚠️ Не удалось найти currency_id для валюты по умолчанию {default_currency}")
             
             # Добавляем банковские реквизиты в remarks если есть (компактный формат для лимита 100 символов)
             remarks_parts = []
@@ -700,14 +845,36 @@ class SupplierContactCreator:
         
         return clean_vat
     
-    def _determine_organization(self, country: str) -> str:
-        """Определяет ID организации Zoho по стране"""
-        # Для польских поставщиков - PARKENTERTAINMENT
-        # Для эстонских и других EU - TaVie Europe
-        if country == "Poland":
-            return "20082562863"  # PARKENTERTAINMENT
-        else:
+    def _determine_organization_by_buyer(self, analysis: Dict) -> str:
+        """Определяет ID организации Zoho по тому, НА КОГО выставлен счет"""
+        # ЛОГИКА: создаем контакт поставщика в ТОЙ организации, куда ему выставлен счет
+        
+        # Проверяем VAT покупателя (buyer_vat, our_company_vat)
+        buyer_vat = analysis.get('buyer_vat', '').replace(' ', '').upper()
+        our_company_vat = analysis.get('our_company_vat', '').replace(' ', '').upper()
+        our_company = analysis.get('our_company', '').lower()
+        
+        # Определяем по VAT покупателя
+        target_vat = buyer_vat or our_company_vat
+        
+        if 'EE102288270' in target_vat:
+            logger.info(f"📋 Счет выставлен на TaVie Europe (VAT: {target_vat})")
             return "20092948714"  # TaVie Europe OÜ
+        elif 'PL5272956146' in target_vat or '5272956146' in target_vat:
+            logger.info(f"📋 Счет выставлен на PARKENTERTAINMENT (VAT: {target_vat})")
+            return "20082562863"  # PARKENTERTAINMENT
+        
+        # Fallback по названию our_company
+        if 'tavie' in our_company:
+            logger.info(f"📋 Определено по названию: TaVie Europe ({our_company})")
+            return "20092948714"
+        elif 'parkentertainment' in our_company:
+            logger.info(f"📋 Определено по названию: PARKENTERTAINMENT ({our_company})")
+            return "20082562863"
+        
+        # По умолчанию PARKENTERTAINMENT (основная организация)
+        logger.warning(f"⚠️ Не удалось определить организацию, используем PARKENTERTAINMENT по умолчанию")
+        return "20082562863"
     
     async def _refresh_cache(self, org_id: Optional[str] = None, org_name: Optional[str] = None, new_contact_data: Optional[Dict[str, Any]] = None):
         """Обновляет кэш ТОЛЬКО новым контактом"""
@@ -813,6 +980,53 @@ class SupplierContactCreator:
             
         except Exception as e:
             logger.error(f"❌ Ошибка определения налоговой ставки: {e}")
+            return None
+    
+    def _get_currency_id_from_code(self, org_id: str, currency_code: str) -> Optional[str]:
+        """
+        Получает currency_id из Zoho Books API по коду валюты
+        
+        Args:
+            org_id: ID организации
+            currency_code: Код валюты (PLN, EUR, USD и т.д.)
+            
+        Returns:
+            currency_id или None если не найдено
+        """
+        try:
+            # Импортируем функцию API
+            from functions.zoho_api import make_zoho_request
+            
+            # Нормализуем код валюты
+            currency_mapping = {
+                "PLN": "PLN", "EUR": "EUR", "USD": "USD",
+                "€": "EUR", "$": "USD", "zł": "PLN",
+                "zloty": "PLN", "euro": "EUR", "dollar": "USD"
+            }
+            
+            normalized_code = currency_mapping.get(currency_code.upper(), currency_code.upper())
+            
+            # Запрашиваем список валют
+            url = f"https://www.zohoapis.eu/books/v3/settings/currencies"
+            params = {"organization_id": org_id}
+            
+            response = make_zoho_request("GET", url, params=params)
+            
+            if response and "currencies" in response:
+                for currency in response["currencies"]:
+                    if currency.get("currency_code") == normalized_code:
+                        currency_id = currency.get("currency_id")
+                        logger.info(f"💰 Найден currency_id: {currency_code} → {currency_id}")
+                        return currency_id
+                
+                logger.warning(f"⚠️ Валюта {normalized_code} не найдена в списке доступных валют")
+                return None
+            else:
+                logger.error(f"❌ Ошибка получения списка валют: {response}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения currency_id для {currency_code}: {e}")
             return None
     
     async def close(self):

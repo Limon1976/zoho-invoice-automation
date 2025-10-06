@@ -341,6 +341,41 @@ def bill_exists(org_id: str, bill_number: str, vendor_id: Optional[str] = None, 
     log_message("ℹ️ Дубликат не найден")
     return None
 
+
+def create_bill(org_id: str, bill_payload: dict) -> dict:
+    """
+    Создает Bill в Zoho Books.
+    
+    Args:
+        org_id: ID организации в Zoho
+        bill_payload: Данные для создания Bill
+        
+    Returns:
+        dict: Ответ от Zoho API с созданным Bill
+    """
+    access_token = get_access_token()
+    if not access_token:
+        return {"error": "Не удалось получить access token"}
+    
+    headers = {"Authorization": f"Zoho-oauthtoken {access_token}", "Content-Type": "application/json"}
+    url = f"{BILLS_URL}?organization_id={org_id}"
+    
+    try:
+        response = requests.post(url, headers=headers, json=bill_payload)
+        data = response.json()
+        
+        if response.status_code in (200, 201) and data.get("bill"):
+            log_message(f"✅ Bill создан успешно: {data['bill'].get('bill_number', 'No number')}")
+            return data
+        else:
+            log_message(f"❌ Ошибка создания Bill: {response.status_code} {data}")
+            return {"error": data}
+            
+    except Exception as e:
+        log_message(f"❌ Исключение при создании Bill: {e}")
+        return {"error": str(e)}
+
+
 def bill_exists_smart(
     org_id: str,
     bill_number: str,
@@ -486,6 +521,42 @@ def bill_exists_smart(
 
     # 3) Fallback к обычному поиску
     return bill_exists(org_id, bill_number, vendor_id, vendor_name)
+
+def create_expense(org_id: str, expense_payload: dict) -> dict:
+    """
+    Создает Expense в Zoho Books
+    
+    Args:
+        org_id: ID организации
+        expense_payload: Данные Expense
+        
+    Returns:
+        dict: Ответ API с созданным Expense
+    """
+    try:
+        import requests
+        
+        access_token = get_access_token()
+        if not access_token:
+            return {"error": "Ошибка получения токена Zoho"}
+            
+        expense_url = f"https://www.zohoapis.eu/books/v3/expenses?organization_id={org_id}"
+        headers = {
+            "Authorization": f"Zoho-oauthtoken {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.post(expense_url, headers=headers, json=expense_payload)
+        response_data = response.json() if response.content else {}
+        
+        if response.status_code == 201 and response_data.get('expense'):
+            return response_data
+        else:
+            return {"error": response_data}
+            
+    except Exception as e:
+        return {"error": str(e)}
+
 
 def get_chart_of_accounts(org_id: str) -> list:
     """
@@ -980,22 +1051,81 @@ def _get_contact_by_vat_api_fallback(vat_number: str, org_id: str) -> dict:
 
 def find_supplier_in_zoho(org_id: str, supplier_name: Optional[str], supplier_vat: Optional[str]) -> Optional[dict]:
     """
-    Комбинированный поиск поставщика: VAT (с разными вариантами) → имя (с нормализацией).
-    Возвращает контакт (полные детали) или None.
+    УНИВЕРСАЛЬНЫЙ поиск поставщика:
+    1. По VAT в кэше
+    2. По ТОЧНОМУ названию в кэше (если VAT = null)
+    3. По названию через API (fallback)
     """
+    log_message(f"🔍 ПОИСК: name='{supplier_name}', vat='{supplier_vat}', org_id={org_id}")
+    
     try:
-        # 1) По VAT (если есть)
+        # 1. Поиск по VAT в кэше
         if supplier_vat:
             c = get_contact_by_vat(supplier_vat, org_id)
             if c:
+                log_message(f"✅ Найден по VAT: {c.get('contact_name')}")
                 return c
-        # 2) По имени (если есть)
+        
+        # 2. УНИВЕРСАЛЬНЫЙ поиск по точному названию ПРЯМО В JSON (обходим проблемы с импортом)
         if supplier_name:
+            log_message(f"🔍 Поиск по названию в JSON кэше...")
+            
+            try:
+                import json
+                from pathlib import Path
+                
+                cache_file = Path(__file__).parent.parent / "data/optimized_cache/all_contacts_optimized.json"
+                
+                if cache_file.exists():
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        cache_data = json.load(f)
+                    
+                    contacts = cache_data.get('contacts', {})
+                    
+                    # Функция очистки названий
+                    def clean_name(name):
+                        import re
+                        # Убираем специальные символы, оставляем только буквы, цифры, пробелы
+                        cleaned = re.sub(r'[^\w\s]', '', str(name).strip().upper())
+                        return re.sub(r'\s+', ' ', cleaned)
+                    
+                    search_clean = clean_name(supplier_name)
+                    log_message(f"🧹 Ищем очищенное название: '{search_clean}'")
+                    
+                    # Поиск среди ВСЕХ контактов
+                    for contact_id, contact_data in contacts.items():
+                        if isinstance(contact_data, dict) and contact_data.get('contact_type') == 'vendor':
+                            cached_name = contact_data.get('company_name', '')
+                            cached_clean = clean_name(cached_name)
+                            
+                            if cached_clean == search_clean:
+                                result = {
+                                    'contact_id': contact_data.get('contact_id'),
+                                    'contact_name': cached_name,
+                                    'vat_number': contact_data.get('vat_number')
+                                }
+                                log_message(f"✅ НАЙДЕН в JSON по названию: {cached_name} (ID: {contact_data.get('contact_id')})")
+                                return result
+                    
+                    log_message(f"❌ НЕ найден в JSON кэше по названию")
+                else:
+                    log_message(f"⚠️ Файл кэша не найден: {cache_file}")
+                    
+            except Exception as cache_e:
+                log_message(f"⚠️ Ошибка поиска в JSON кэше: {cache_e}")
+        
+        # 3. Fallback: поиск по названию через API
+        if supplier_name:
+            log_message(f"🔍 Fallback: поиск через API...")
             c = get_contact_by_name(supplier_name, org_id)
             if c:
+                log_message(f"✅ Найден через API: {c.get('contact_name')}")
                 return c
+        
     except Exception as e:
         log_message(f"⚠️ find_supplier_in_zoho error: {e}")
+    
+    log_message(f"❌ Поставщик НЕ найден НИГДЕ")
     return None
 
 def search_contacts_smart(search_term: str, org_id: str, search_type: str = "auto") -> list:

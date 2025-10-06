@@ -84,6 +84,3 @@ async def force_update_vat(
     )
     debug['verify_values'] = list(values)
     return applied, target_vat, debug
-
-
-q

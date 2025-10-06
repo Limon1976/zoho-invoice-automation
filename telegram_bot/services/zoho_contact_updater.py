@@ -79,6 +79,14 @@ async def update_contact(zoho_client, org_id: str, contact_id: str, analysis: Di
 
     # 2) Other fields
     update_data: Dict[str, Any] = {}
+    
+    # Email обновление
+    if analysis.get('supplier_email'):
+        email = analysis.get('supplier_email').strip()
+        if email and '@' in email:
+            update_data['email'] = email[:100]
+    
+    # Phone обновление
     phone_info = normalize_phone(analysis.get('supplier_phone'), analysis.get('supplier_country'))
     if phone_info:
         update_data['phone'] = phone_info.get('phone')

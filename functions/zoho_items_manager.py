@@ -31,8 +31,13 @@ class CarItemData:
     selling_price: float   # Цена продажи
     unit: str = "pcs"      # Единица измерения
     tax_id: Optional[str] = None  # ID налога из Zoho
+    # НОВЫЕ ПОЛЯ ДЛЯ PARKENTERTAINMENT
+    mileage: Optional[int] = None  # Пробег в км для определения категории
+    vin: Optional[str] = None      # VIN номер для специального поля
+    original_currency: Optional[str] = None  # Валюта документа (EUR, USD)
+    document_date: Optional[str] = None      # Дата документа для курса валют
     
-    def to_zoho_format(self) -> Dict[str, Any]:
+    def to_zoho_format(self, organization_id: Optional[str] = None) -> Dict[str, Any]:
         """Конвертация в формат Zoho Books API"""
         item_data = {
             "name": self.name,
@@ -53,11 +58,73 @@ class CarItemData:
             "initial_stock_rate": 0  # ВСЕГДА 0
         }
         
+        # СПЕЦИАЛЬНЫЕ НАСТРОЙКИ ДЛЯ PARKENTERTAINMENT
+        if organization_id == "20082562863":  # PARKENTERTAINMENT
+            # Определяем категорию по пробегу
+            category = "Used car"  # По умолчанию
+            if self.mileage is not None and self.mileage <= 100:
+                category = "New car"
+                log_message(f"🚗 Категория: {category} (пробег: {self.mileage} км)")
+            else:
+                log_message(f"🚗 Категория: {category} (пробег: {self.mileage or 'N/A'} км)")
+            
+            item_data.update({
+                # Track Inventory уже установлен в базовом item_data
+                "track_serial_number": True,    # ✅ Advanced Inventory Tracking: Track Serial Number
+                "enable_bin_tracking": True,    # ✅ Track Bin location for this item (альтернативное поле)
+                "category_name": category,      # ✅ Category: New car/Used car (исправленное поле)
+            })
+            
+            # Добавляем VIN в специальное поле если есть
+            if self.vin:
+                # Пробуем разные поля для VIN
+                item_data["serial_number"] = self.vin  # Возможно VIN должен быть в serial_number
+                item_data["notes"] = f"VIN: {self.vin}"  # Дублируем в notes
+                # Альтернативно: item_data["vin"] = self.vin
+                log_message(f"🚗 VIN добавлен в serial_number и notes: {self.vin}")
+            
+            log_message(f"🇵🇱 PARKENTERTAINMENT: Track Serial Number=True, Bin Tracking=True, Category={category}")
+        
         # Добавляем tax_id только если он есть
         if self.tax_id:
             item_data["tax_id"] = self.tax_id
             
         return item_data
+
+
+def convert_currency_to_pln(amount: float, from_currency: str, document_date: str, organization_id: str) -> float:
+    """
+    Конвертирует валюту в PLN используя курс Zoho на дату документа
+    
+    Args:
+        amount: Сумма для конвертации
+        from_currency: Исходная валюта (EUR, USD)
+        document_date: Дата документа для определения курса
+        organization_id: ID организации для запроса курса
+    
+    Returns:
+        Сумма в PLN
+    """
+    if from_currency.upper() == "PLN":
+        return amount
+    
+    try:
+        # TODO: Реализовать запрос курса валют из Zoho API
+        # Пока используем примерные курсы
+        rates = {
+            "EUR": 4.3,  # 1 EUR = 4.3 PLN (примерный курс)
+            "USD": 4.0,  # 1 USD = 4.0 PLN (примерный курс)
+        }
+        
+        rate = rates.get(from_currency.upper(), 1.0)
+        converted = amount * rate
+        
+        log_message(f"💱 Конвертация: {amount} {from_currency} → {converted:.2f} PLN (курс: {rate})")
+        return converted
+        
+    except Exception as e:
+        log_message(f"❌ Ошибка конвертации валют: {e}")
+        return amount  # Возвращаем оригинальную сумму
 
 
 class ZohoItemsManager:
@@ -92,6 +159,21 @@ class ZohoItemsManager:
             }
             
             response = requests.get(taxes_url, headers=headers, params=params)
+            
+            # Если ошибка 401 - обновляем токен и повторяем запрос
+            if response.status_code == 401:
+                log_message("🔄 Токен истек при получении налогов, обновляю...")
+                # Сбрасываем кэшированный токен и получаем новый
+                try:
+                    import functions.zoho_api as zoho_api
+                    zoho_api.ACCESS_TOKEN = None
+                    new_token = zoho_api.get_access_token()
+                    if new_token:
+                        headers['Authorization'] = f'Zoho-oauthtoken {new_token}'
+                        response = requests.get(taxes_url, headers=headers, params=params)
+                        log_message(f"🔄 Повторный запрос налогов: {response.status_code}")
+                except Exception as e:
+                    log_message(f"❌ Ошибка обновления токена: {e}")
             
             if response.status_code == 200:
                 data = response.json()
@@ -230,6 +312,21 @@ class ZohoItemsManager:
             
             response = requests.get(search_url, headers=headers, params=params)
             
+            # Если ошибка 401 - обновляем токен и повторяем запрос
+            if response.status_code == 401:
+                log_message("🔄 Токен истек при проверке SKU, обновляю...")
+                # Сбрасываем кэшированный токен и получаем новый
+                try:
+                    import functions.zoho_api as zoho_api
+                    zoho_api.ACCESS_TOKEN = None
+                    new_token = zoho_api.get_access_token()
+                    if new_token:
+                        headers['Authorization'] = f'Zoho-oauthtoken {new_token}'
+                        response = requests.get(search_url, headers=headers, params=params)
+                        log_message(f"🔄 Повторный запрос SKU: {response.status_code}")
+                except Exception as e:
+                    log_message(f"❌ Ошибка обновления токена: {e}")
+            
             if response.status_code == 200:
                 data = response.json()
                 items = data.get('items', [])
@@ -292,10 +389,28 @@ class ZohoItemsManager:
                 'Content-Type': 'application/json'
             }
             
-            item_data = car_data.to_zoho_format()
+            item_data = car_data.to_zoho_format(organization_id)
             log_message(f"🚗 Создаю ITEM: {car_data.name} (SKU: {car_data.sku})")
+            log_message(f"📋 DEBUG: Отправляемый JSON в Zoho: {item_data}")
             
             response = requests.post(create_url, headers=headers, params=params, json=item_data)
+            
+            # Если ошибка 401 - обновляем токен и повторяем запрос
+            if response.status_code == 401:
+                log_message("🔄 Токен истек, обновляю и повторяю запрос...")
+                # Сбрасываем кэшированный токен и получаем новый
+                try:
+                    import functions.zoho_api as zoho_api
+                    zoho_api.ACCESS_TOKEN = None
+                    new_token = zoho_api.get_access_token()
+                    if new_token:
+                        headers['Authorization'] = f'Zoho-oauthtoken {new_token}'
+                        response = requests.post(create_url, headers=headers, params=params, json=item_data)
+                        log_message(f"🔄 Повторный запрос: {response.status_code}")
+                    else:
+                        log_message("❌ Не удалось обновить токен")
+                except Exception as e:
+                    log_message(f"❌ Ошибка обновления токена: {e}")
             
             if response.status_code == 201:
                 data = response.json()
@@ -427,7 +542,7 @@ class ZohoItemsManager:
                 'Content-Type': 'application/json'
             }
             
-            item_data = car_data.to_zoho_format()
+            item_data = car_data.to_zoho_format(organization_id)
             log_message(f"🔄 Обновляю ITEM: {car_data.name} (SKU: {car_data.sku})")
             
             response = requests.put(update_url, headers=headers, params=params, json=item_data)
@@ -652,4 +767,4 @@ if __name__ == "__main__":
     # Тест проверки конкретного VIN
     test_vin = "W1V44781313926375"
     exists = manager.check_sku_exists(test_vin)
-    print(f"\n🔍 Проверка VIN {test_vin}: {'❌ Существует' if exists else '✅ Не найден'}") 
+    print(f"\n🔍 Проверка VIN {test_vin}: {'❌ Существует' if exists else '✅ Не найден'}")

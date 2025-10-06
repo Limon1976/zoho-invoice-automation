@@ -233,6 +233,7 @@ class SmartDocumentProcessor:
                     'service_description': llm_data.get('service_description') or '',
                     'product_category': llm_data.get('product_category') or '',
                     'detected_flower_names': llm_data.get('detected_flower_names') or [],
+                    'line_items': llm_data.get('line_items') or [],
                     'bank_name': (llm_data.get('bank') or {}).get('bank_name') or '',
                     'bank_address': (llm_data.get('bank') or {}).get('bank_address') or '',
                     'bank_account': (llm_data.get('bank') or {}).get('bank_account') or '',
@@ -242,6 +243,11 @@ class SmartDocumentProcessor:
                     'issuer_name': llm_data.get('issuer_name') or llm_data.get('seller_name') or '',
                     'issuer_vat': llm_data.get('issuer_vat') or llm_data.get('seller_vat') or '',
                     'issuer_contact_person': llm_data.get('issuer_contact_person') or '',
+                    # BUYER/SELLER ПОЛЯ ДЛЯ УНИВЕРСАЛЬНОЙ ЛОГИКИ
+                    'buyer_name': llm_data.get('buyer_name') or '',
+                    'buyer_vat': llm_data.get('buyer_vat') or '',
+                    'seller_name': llm_data.get('seller_name') or llm_data.get('issuer_name') or '',
+                    'seller_vat': llm_data.get('seller_vat') or llm_data.get('issuer_vat') or '',
                     # LLM категория и цветы для принудительного парсинга
                     'product_category': llm_data.get('product_category') or '',
                     'detected_flower_names': llm_data.get('detected_flower_names') or [],

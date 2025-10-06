@@ -258,4 +258,7 @@ cache/
 last_folder.txt 
 
 # Debug uploads - test files from API
-debug_uploads/ 
+debug_uploads/
+
+# MCP servers (external repositories)
+mcp_servers/

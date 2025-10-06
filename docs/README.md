@@ -135,13 +135,35 @@ result = analyze_proforma_via_agent('path/to/document.pdf')
 print(result)
 ```
 
+### Create supplier with proper address structure
+```python
+from functions.universal_supplier_creator import create_supplier_universal
+
+# Analysis from document processing
+analysis = {
+    'supplier_name': 'Company Name',
+    'supplier_vat': 'PL1234567890',
+    'supplier_street': 'Street Address',
+    'supplier_city': 'City Name',
+    'supplier_zip_code': '00-000',
+    'supplier_country': 'Poland',
+    # ... other fields
+}
+
+# Create supplier with proper address fields
+supplier = await create_supplier_universal(analysis, org_id='20082562863')
+```
+
 ## 📁 Project Structure
 
 ```
 ├── functions/              # Core processing logic
 │   ├── agent_invoice_parser.py  # AI document analysis
 │   ├── assistant_logic.py       # OpenAI Assistant logic
-│   └── zoho_api.py             # Zoho integration
+│   ├── zoho_api.py             # Zoho integration
+│   ├── universal_supplier_creator.py  # Universal supplier creation
+│   ├── contact_creator.py       # Contact creation logic
+│   └── universal_document_processor.py  # Universal document processing
 ├── telegram_bot/          # Telegram bot
 ├── mcp_connector/          # MCP connector
 ├── watcher/               # File monitoring
